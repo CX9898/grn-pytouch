@@ -1,5 +1,6 @@
 #include <cublas_v2.h>
 #include <cuda_runtime_api.h>
+#include <cstdio>
 
 #include "blas.h"
 #include "device_assert.h"
@@ -71,31 +72,33 @@ void PointwiseOperations(const int batch_dim,
     dq_out[idx + 1 * hidden_dim] = dq_r;
     dq_out[idx + 2 * hidden_dim] = dq_g;
 
-    atomicAdd(&dbx_out[row + 0 * hidden_dim], dp_z);
-    atomicAdd(&dbx_out[row + 1 * hidden_dim], dp_r);
-    atomicAdd(&dbx_out[row + 2 * hidden_dim], dp_g);
+    atomicAddCustom(&dbx_out[row + 0 * hidden_dim], dp_z);
+    atomicAddCustom(&dbx_out[row + 1 * hidden_dim], dp_r);
+    atomicAddCustom(&dbx_out[row + 2 * hidden_dim], dp_g);
 
-    atomicAdd(&dbr_out[row + 0 * hidden_dim], dq_z);
-    atomicAdd(&dbr_out[row + 1 * hidden_dim], dq_r);
-    atomicAdd(&dbr_out[row + 2 * hidden_dim], dq_g);
+    atomicAddCustom(&dbr_out[row + 0 * hidden_dim], dq_z);
+    atomicAddCustom(&dbr_out[row + 1 * hidden_dim], dq_r);
+    atomicAddCustom(&dbr_out[row + 2 * hidden_dim], dq_g);
 }
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+
 template<typename T, bool ApplyZoneout>
 __global__
 void PointwiseOperations(const int batch_dim,
                          const int hidden_dim,
-                         const half* h,
-                         const half* v,
-                         const half* dh_new,
-                         half* dbx_out,
-                         half* dbr_out,
-                         half* dh_inout,
-                         half* dp_out,
-                         half* dq_out,
-                         const half* zoneout_mask) {
-  device_assert_fail("FP16 is not supported on compute capability < 7.0.");
+                         const half *h,
+                         const half *v,
+                         const half *dh_new,
+                         half *dbx_out,
+                         half *dbr_out,
+                         half *dh_inout,
+                         half *dp_out,
+                         half *dq_out,
+                         const half *zoneout_mask) {
+    device_assert_fail("FP16 is not supported on compute capability < 7.0.");
 }
+
 #endif
 
 }  // anonymous namespace
@@ -168,9 +171,14 @@ void BackwardPass<T>::Iterate(
     const T *zoneout_mask) {  // [N,H]
     const blas<void>::set_pointer_mode scoped1(data_->blas_handle);
 
-    const T alpha = static_cast<T>(1.0);
-    const T beta_sum = static_cast<T>(1.0);
-    const T beta_assign = static_cast<T>(0.0);
+    using alpha_beta_t = std::conditional_t<
+        std::is_same_v<T, int8_t> || std::is_same_v<T, int16_t>,
+        int,
+        T>;
+
+    static const alpha_beta_t alpha = static_cast<alpha_beta_t>(1.0);
+    static const alpha_beta_t beta_sum = static_cast<alpha_beta_t>(1.0);
+    static const alpha_beta_t beta_assign = static_cast<alpha_beta_t>(0.0);
 
     const int batch_size = data_->batch_size;
     const int hidden_size = data_->hidden_size;
@@ -244,8 +252,14 @@ void BackwardPass<T>::IterateInternal(
     T *dp,            // [N,H*3]
     T *dq,            // [N,H*3]
     const T *zoneout_mask) {  // [N,H]
-    const T alpha = static_cast<T>(1.0);
-    const T beta_sum = static_cast<T>(1.0);
+
+    using alpha_beta_t = std::conditional_t<
+        std::is_same_v<T, int8_t> || std::is_same_v<T, int16_t>,
+        int,
+        T>;
+
+    static const alpha_beta_t alpha = static_cast<alpha_beta_t>(1.0);
+    static const alpha_beta_t beta_sum = static_cast<alpha_beta_t>(1.0);
 
     const int batch_size = data_->batch_size;
     const int hidden_size = data_->hidden_size;
@@ -358,6 +372,8 @@ void BackwardPass<T>::Run(
     // data dependency between its output (`dp`, `dq`) and the following matmuls.
     cudaStreamWaitEvent(stream2, event, 0);
 
+    printf("cudaError(BackwardPass): %s\n", cudaGetErrorString(cudaGetLastError()));
+
     cublasSetStream(blas_handle, stream2);
     blas<T>::gemm(blas_handle,
                   CUBLAS_OP_N, CUBLAS_OP_N,
@@ -391,10 +407,106 @@ void BackwardPass<T>::Run(
     cublasSetStream(blas_handle, save_stream);
 }
 
-//template
-//struct BackwardPass<int8_t>;
+template<>
+void BackwardPass<int8_t>::Run(
+    const int steps,
+    const int8_t *W_t,
+    const int8_t *R_t,
+    const int8_t *bx,
+    const int8_t *br,
+    const int8_t *x_t,
+    const int8_t *h,
+    const int8_t *v,
+    const int8_t *dh_new,
+    int8_t *dx,
+    int8_t *dW,
+    int8_t *dR,
+    int8_t *dbx,
+    int8_t *dbr,
+    int8_t *dh,
+    int8_t *dp,
+    int8_t *dq,
+    const int8_t *zoneout_mask) {
+    const blas<void>::enable_tensor_cores scoped0(data_->blas_handle);
+    const blas<void>::set_pointer_mode scoped1(data_->blas_handle);
+
+    const int alpha = static_cast<int>(1.0);
+    const int beta_sum = static_cast<int>(1.0);
+    const int beta_assign = static_cast<int>(0.0);
+
+    const int batch_size = data_->batch_size;
+    const int input_size = data_->input_size;
+    const int hidden_size = data_->hidden_size;
+    const cublasHandle_t blas_handle = data_->blas_handle;
+    const cudaStream_t stream1 = data_->stream[0];
+    const cudaStream_t stream2 = data_->stream[1];
+    const cudaEvent_t event = data_->event;
+
+    cudaStream_t save_stream;
+    cublasGetStream(blas_handle, &save_stream);
+
+    printf("cudaError(BackwardPass): %s\n", cudaGetErrorString(cudaGetLastError()));
+
+    const int NH = batch_size * hidden_size;
+    for (int i = steps - 1; i >= 0; --i) {
+        IterateInternal(
+            R_t,
+            h + i * NH,
+            v + i * NH * 4,
+            dh_new + (i + 1) * NH,
+            dbx,
+            dbr,
+            dh,
+            dp + i * NH * 3,
+            dq + i * NH * 3,
+            zoneout_mask ? zoneout_mask + i * NH : nullptr);
+    }
+
+    // Wait for pointwise operations to complete since there's a
+    // data dependency between its output (`dp`, `dq`) and the following matmuls.
+    cudaStreamWaitEvent(stream2, event, 0);
+
+    printf("cudaError(BackwardPass): %s\n", cudaGetErrorString(cudaGetLastError()));
+
+    cublasSetStream(blas_handle, stream2);
+    blas<int8_t>::gemm(blas_handle,
+                  CUBLAS_OP_N, CUBLAS_OP_N,
+                  input_size, batch_size * steps, hidden_size * 3,
+                  &alpha,
+                  W_t, input_size,
+                  dp, hidden_size * 3,
+                  &beta_assign,
+                  dx, input_size);
+
+    cublasSetStream(blas_handle, stream2);
+    blas<int8_t>::gemm(blas_handle,
+                  CUBLAS_OP_N, CUBLAS_OP_T,
+                  hidden_size * 3, hidden_size, batch_size * steps,
+                  &alpha,
+                  dq, hidden_size * 3,
+                  h, hidden_size,
+                  &beta_sum,
+                  dR, hidden_size * 3);
+
+    cublasSetStream(blas_handle, stream1);
+    blas<int8_t>::gemm(blas_handle,
+                  CUBLAS_OP_N, CUBLAS_OP_N,
+                  hidden_size * 3, input_size, batch_size * steps,
+                  &alpha,
+                  dp, hidden_size * 3,
+                  x_t, batch_size * steps,
+                  &beta_sum,
+                  dW, hidden_size * 3);
+
+    cublasSetStream(blas_handle, save_stream);
+}
+
 template
-struct BackwardPass<half>;
+struct BackwardPass<int8_t>;
+//template
+//struct BackwardPass<int16_t>;
+//template
+//struct BackwardPass<half>;
 template
 struct BackwardPass<float>;
 template

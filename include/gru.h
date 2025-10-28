@@ -1,18 +1,3 @@
-// Copyright 2020 LMNT, Inc. All Rights Reserved.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//    http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-// ==============================================================================
-
 #pragma once
 
 #include <cublas_v2.h>
@@ -106,6 +91,7 @@ class ForwardPass {
       T *v,
       T *tmp_Wx,
       T *tmp_Rh,
+      int32_t *tmp_Rh_i32, // 为了储存cuBLAS的GEMM中int32输出
       const float zoneout_prob,
       const T *zoneout_mask);
 
@@ -226,3 +212,21 @@ class BackwardPass {
 
 }  // namespace gru
 
+
+namespace kernel {
+template<typename T>
+__device__ __forceinline__ int8_t quantize(
+    T value,
+    T scale,
+    T zero_point
+) {
+    // value / scale + zero_point，然后 round 到最近的整数
+    T quantized = value / scale + zero_point;
+    quantized = roundf(quantized);
+
+    // 限制范围 [-128, 127] (INT8)
+    quantized = fmaxf(-128.0f, fminf(127.0f, quantized));
+
+    return static_cast<int8_t>(quantized);
+}
+}

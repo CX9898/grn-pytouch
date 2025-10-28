@@ -1,26 +1,20 @@
 #include <Eigen/Dense>
-#include <cassert>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
-#include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <iostream>
 #include <string>
 #include <unsupported/Eigen/CXX11/Tensor>
-#include <vector>
 
 #include "device_ptr.h"
 #include "gru.h"
 
-//using haste::v0::gru::ForwardPass;
-//using haste::v0::gru::BackwardPass;
-using std::string;
+using INPUT_TPYE = int8_t;
 
-using Tensor1 = Eigen::Tensor<float, 1>;
-using Tensor2 = Eigen::Tensor<float, 2>;
-using Tensor3 = Eigen::Tensor<float, 3>;
+using Tensor1 = Eigen::Tensor<INPUT_TPYE, 1>;
+using Tensor2 = Eigen::Tensor<INPUT_TPYE, 2>;
+using Tensor3 = Eigen::Tensor<INPUT_TPYE, 3>;
 
 constexpr int BATCH_SIZE = 64; // 批大小
 constexpr int SEQUENCE_LEN = 1000; // 序列长度(T), 每个样本有T个时间步
@@ -31,7 +25,7 @@ static cublasHandle_t g_blas_handle;
 
 class ScopeTimer { // 测量时间类
  public:
-  ScopeTimer(const string &msg) : msg_(msg) {
+  ScopeTimer(const std::string &msg) : msg_(msg) {
       cudaEventCreate(&start_);
       cudaEventCreate(&stop_);
       cudaDeviceSynchronize();
@@ -49,7 +43,7 @@ class ScopeTimer { // 测量时间类
   }
 
  private:
-  string msg_;
+  std::string msg_;
   cudaEvent_t start_, stop_;
 };
 
@@ -79,7 +73,7 @@ void GruInference(
 
     ScopeTimer t("Inference:");
 
-    gru::ForwardPass<float> forward = gru::ForwardPass<float>(
+    gru::ForwardPass<INPUT_TPYE> forward = gru::ForwardPass<INPUT_TPYE>(
         false,  // training
         batch_size,
         input_size,
@@ -130,7 +124,7 @@ void GruTrain(
 
     {
         ScopeTimer t("Train forward:");
-        gru::ForwardPass<float> forward = gru::ForwardPass<float>(
+        gru::ForwardPass<INPUT_TPYE> forward = gru::ForwardPass<INPUT_TPYE>(
             true,  // training
             batch_size,
             input_size,
@@ -163,7 +157,7 @@ void GruTrain(
 
     {
         ScopeTimer t("Train backward:");
-        gru::BackwardPass<float> backward(
+        gru::BackwardPass<INPUT_TPYE> backward(
             batch_size,
             input_size,
             hidden_size,
@@ -216,7 +210,10 @@ int main() {
     dh.setRandom();
 
     GruInference(W, R, bx, br, x);
+
+
     GruTrain(W, R, bx, br, x, dh);
+
 
     cublasDestroy(g_blas_handle);
 
