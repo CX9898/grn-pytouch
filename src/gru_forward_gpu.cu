@@ -33,13 +33,12 @@ __global__ void quantize_int32_to_int8(const int32_t *tmp_Wx_dev, int8_t *tmp_Wx
 enum class GemmTranspose { N, T };
 
 // int8 GEMM + 量化 kernel 支持转置
+template<GemmTranspose transA, GemmTranspose transB>
 __global__ void gemm_int8_requant_kernel(const int8_t *__restrict__ A,
                                          const int8_t *__restrict__ B,
                                          int8_t *__restrict__ C,
                                          int M, int N, int K,
-                                         float scale,
-                                         GemmTranspose transA,
-                                         GemmTranspose transB) {
+                                         float scale) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -62,15 +61,26 @@ __global__ void gemm_int8_requant_kernel(const int8_t *__restrict__ A,
 
 template<typename T, bool Training, bool ApplyZoneout>
 __global__ void PointwiseOperations(
-    const int batch_dim, const int hidden_dim, const T *Wx, const T *Rh,
-    const T *bx, const T *br, const T *h, T *h_out, T *v, const T zoneout_prob,
-    const T *zoneout_mask) {  // Zoneout mask (only used if ApplyZoneout==true)
-    const int row = blockDim.x * blockIdx.x + threadIdx.x;
-    const int col = blockDim.y * blockIdx.y + threadIdx.y;
+    const int batch_dim, // 批量大小
+    const int hidden_dim, // 隐藏单元数
+    const T *Wx, // 前向矩阵乘W * x, 包含Wz, Wr, Wh
+    const T *Rh, // 前向矩阵乘R * h, 包含Rz, Rr, Rh
+    const T *bx, // 输入偏置, 包含bz, br, bh
+    const T *br, // 隐藏偏置, 包含bz, br, bh
+    const T *h, // 上一时间步隐藏状态
+    T *h_out, // 当前时间步隐藏状态
+    T *v, // 保存内部分量用于反向传播
+    const T zoneout_prob, // Zoneout概率
+    const T *zoneout_mask // 训练模式用
+) {  // Zoneout mask (only used if ApplyZoneout==true)
 
-    if (row >= hidden_dim || col >= batch_dim) return;
+    /* 计算索引 */
+    const int row = blockDim.x * blockIdx.x + threadIdx.x; // 当前线程对应的隐藏单元
+    const int col = blockDim.y * blockIdx.y + threadIdx.y; // 当前线程对应的batch样本
 
-    const int weight_idx = col * (hidden_dim * 3) + row;
+    if (row >= hidden_dim || col >= batch_dim) return; // 边缘判断
+
+    const int weight_idx = col * (hidden_dim * 3) + row; // 用于访问 [Wx, Rh] 的展开索引
 
     // Index into the `h` and `h_out` vectors (they have a stride of
     // `hidden_dim`).
@@ -83,14 +93,16 @@ __global__ void PointwiseOperations(
     const int g_idx = weight_idx + 2 * hidden_dim;
 
     // Indices into the bias vectors (for each of the u, r, and e components).
-    const int bz_idx = row + 0 * hidden_dim;
-    const int br_idx = row + 1 * hidden_dim;
-    const int bg_idx = row + 2 * hidden_dim;
+    const int bz_idx = row + 0 * hidden_dim; // 更新门对应索引
+    const int br_idx = row + 1 * hidden_dim; // 重置门对应索引
+    const int bg_idx = row + 2 * hidden_dim; // 候选状态对应索引
 
-    const T z = dev::sigmoid(Wx[z_idx] + Rh[z_idx] + bx[bz_idx] + br[bz_idx]);
-    const T r = dev::sigmoid(Wx[r_idx] + Rh[r_idx] + bx[br_idx] + br[br_idx]);
-    const T g = dev::tanh(Wx[g_idx] + r * (Rh[g_idx] + br[bg_idx]) + bx[bg_idx]);
+    /* GRU前向计算 */
+    const T z = dev::sigmoid(Wx[z_idx] + Rh[z_idx] + bx[bz_idx] + br[bz_idx]); // 更新门z
+    const T r = dev::sigmoid(Wx[r_idx] + Rh[r_idx] + bx[br_idx] + br[br_idx]); // 重置门r
+    const T g = dev::tanh(Wx[g_idx] + r * (Rh[g_idx] + br[bg_idx]) + bx[bg_idx]); // 候选状态~ht
 
+    /* 训练模式 */
     // Store internal activations if we're eventually going to backprop.
     if (Training) {
         const int base_v_idx = col * (hidden_dim * 4) + row;
@@ -100,8 +112,9 @@ __global__ void PointwiseOperations(
         v[base_v_idx + 3 * hidden_dim] = Rh[g_idx] + br[bg_idx];
     }
 
-    T cur_h_value = z * h[output_idx] + (static_cast<T>(1.0) - z) * g;
+    T cur_h_value = z * h[output_idx] + (static_cast<T>(1.0) - z) * g; // 当前时间步最终隐藏状态ht
 
+    /* 启用Zoneout, 对GRU 隐藏状态的随机保留 */
     if (ApplyZoneout) {
         if (Training) {
             cur_h_value = (cur_h_value - h[output_idx]) * zoneout_mask[output_idx] +
@@ -112,6 +125,7 @@ __global__ void PointwiseOperations(
         }
     }
 
+    /* 结果储存 */
     h_out[output_idx] = cur_h_value;
 }
 
@@ -263,8 +277,8 @@ void ForwardPass<T>::IterateInternal(
 
     cudaStreamWaitEvent(stream1, event, 0);
 
-    if (training) {
-        if (zoneout_prob && zoneout_mask) {
+    if (training) { // 训练模式
+        if (zoneout_prob && zoneout_mask) { // 启用Zoneout, 对GRU 隐藏状态的随机保留
             kernel::PointwiseOperations<T, true, true><<<gridDim, blockDim, 0, stream1>>>(
                 batch_size, hidden_size, tmp_Wx, tmp_Rh, bx, br, h, h_out, v,
                     zoneout_prob, zoneout_mask);
@@ -273,7 +287,7 @@ void ForwardPass<T>::IterateInternal(
                 batch_size, hidden_size, tmp_Wx, tmp_Rh, bx, br, h, h_out, v, 0.0f,
                     nullptr);
         }
-    } else {
+    } else { // 推理模式
         if (zoneout_prob && zoneout_mask) {
             kernel::PointwiseOperations<T, false, true><<<gridDim, blockDim, 0, stream1>>>(
                 batch_size, hidden_size, tmp_Wx, tmp_Rh, bx, br, h, h_out, nullptr,
@@ -320,8 +334,8 @@ void ForwardPass<int8_t>::IterateInternal(
                        batch_size, hidden_size, &alpha, R, hidden_size * 3, h,
                        hidden_size, &beta, tmp_Rh_i32, hidden_size * 3);
 
-    // Optionally synchronize if needed
-    cudaStreamSynchronize(stream1);
+//    // Optionally synchronize if needed
+//    cudaStreamSynchronize(stream1);
 
     const int M = data_->hidden_size * 3;
     const int N = data_->batch_size;
@@ -333,8 +347,8 @@ void ForwardPass<int8_t>::IterateInternal(
     // Launch the kernel to quantize tmp_Wx_dev to tmp_Wx
     kernel::quantize_int32_to_int8<<<grid, block, 0, stream1>>>(tmp_Rh_i32, tmp_Rh, M, N, scale);
 
-    // Optionally synchronize if needed
-    cudaStreamSynchronize(stream1);
+//    // Optionally synchronize if needed
+//    cudaStreamSynchronize(stream1);
 
     // Compute launch configuration for pointwise operations kernel.
     const dim3 blockDim(32, 16);
@@ -343,8 +357,8 @@ void ForwardPass<int8_t>::IterateInternal(
 
     cudaStreamWaitEvent(stream1, event, 0);
 
-    if (training) {
-        if (zoneout_prob && zoneout_mask) {
+    if (training) { // 训练模式
+        if (zoneout_prob && zoneout_mask) { // 启用Zoneout, 对GRU 隐藏状态的随机保留
             kernel::PointwiseOperations<int8_t, true, true><<<gridDim, blockDim, 0, stream1>>>(
                 batch_size, hidden_size, tmp_Wx, tmp_Rh, bx, br, h, h_out, v,
                     zoneout_prob, zoneout_mask);
@@ -353,7 +367,7 @@ void ForwardPass<int8_t>::IterateInternal(
                 batch_size, hidden_size, tmp_Wx, tmp_Rh, bx, br, h, h_out, v, 0.0f,
                     nullptr);
         }
-    } else {
+    } else { // 推理模式
         if (zoneout_prob && zoneout_mask) {
             kernel::PointwiseOperations<int8_t, false, true><<<gridDim, blockDim, 0, stream1>>>(
                 batch_size, hidden_size, tmp_Wx, tmp_Rh, bx, br, h, h_out, nullptr,
@@ -372,7 +386,8 @@ void gemm_int8_requant(const int8_t *A, const int8_t *B, int8_t *C,
     dim3 block(16, 16);
     dim3 grid((N + block.x - 1) / block.x, (M + block.y - 1) / block.y);
 
-    kernel::gemm_int8_requant_kernel<<<grid, block, 0, stream>>>(A, B, C, M, N, K, scale, kernel::GemmTranspose::N, kernel::GemmTranspose::N);
+    kernel::gemm_int8_requant_kernel<kernel::GemmTranspose::N, kernel::GemmTranspose::N>
+    <<<grid, block, 0, stream>>>(A, B, C, M, N, K, scale);
     cudaStreamSynchronize(stream);
 }
 
