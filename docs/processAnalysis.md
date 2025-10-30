@@ -38,10 +38,12 @@ void ForwardPass<T, AccumT>::Run(const int steps, // 时间步数, 序列长度T
                                  AccumT *tmp_Rh,    // [N,H*3], R * h 的临时结果
                                  const float zoneout_prob, // Zoneout 概率，用于随机丢弃部分隐藏状态
                                  const T *zoneout_mask, // Zoneout mask，0/1 矩阵，控制哪些隐藏单元被保留,  // Zoneout mask [N,H]
-                                 const QuantParams &quantParams, // 形式是怎么样的?
+                                 const QuantParams &quantParams, // 形式是怎么样的? 如果内部自己算就不需要传入
                                  ){}
 
 struct QuantParams {
+    // 示例
+    
     // ==========================
     // 输入 / 权重 / 隐状态 scale & zero_point
     // ==========================
@@ -105,11 +107,10 @@ struct QuantParams {
 
 - x输入进入的是int8还是float? (float)x的话则先进行 -量化-> (int8)x
 - 其他参数是怎么得到? 例如W, R, bx, br. 使用训练阶段得到的float, 然后部署前量化成int8
-- 数据类型定为int8和int32是否可以?
 
 **流程:**
 
-1. 如果不是在外部传入各个scale的话, 先读取x, W, R, h的最大最小值用于计算各个scale和zero_point.
+1. 如果不是在外部传入各个scale的话, 先查找x, W, R, h的最大最小值用于计算各个scale和zero_point.
 2. 调用cuBLAS::gemm<int8>计算 (int8)W * (int8)x, 输出(int32)Wx // int8 * int8 -> int32
 3. (int32)Wx的scale_Wx = s_w * s_x. (parameter scaling)
 4. for i in 0..steps-1: 循环每个时间步
@@ -121,16 +122,19 @@ struct QuantParams {
             - 各个门计算前保证各个变量的scale一致. 例如:Wx: scale_Wx, Rh: scale_Rh, bx: scale_bx(通常等于 scale_Wx), br:
               scale_br(通常等于 scale_Rh).
             -
+            - **更新门z:**
             - int32_t Rh_aligned = (Rh[r_idx] * M_Rh_z + (1 << (shift_Rh - 1))) >> shift_Rh_z; // 对齐到 Wx 的 scale
             - int32_t br_aligned = (br[bz_idx] * M_br_z + (1 << (shift_br - 1))) >> shift_br_z; // 对齐到 Wx 的 scale
             - int32 z_tmp_i32 = (int32)Wx[z_idx] + (int32)Rh_aligned + (int32)bx[bz_idx] + (int32)br_aligned; // 更新门计算公式
             - int8 z_tmp_i8 = quantize_i32_to_i8(z_tmp_i32, scale_z, zero_point_z); // 量化为int8
             - const int8 z = dev::sigmoid_int8_lut(z_tmp_i8); // 更新门z
             -
+            - **重置门r**
             - int32 r_tmp_i32 = (int32)Wx[r_idx] + (int32)Rh[r_idx] + (int32)bx[br_idx] + (int32)br[br_idx]; // 重置门计算公式
             - int8 r_tmp_i8 = quantize_i32_to_i8(r_tmp_i32, scale_r, zero_point_r); // 量化为int8
             - const int8 r = dev::sigmoid_int8_lut(r_tmp_i8); // 重置门r
             -
+            - **候选状态~ht**
             - int64_t tmp_r_Rh_bx = (int64_t)r_int32 * (int64_t)((int32)Rh[g_idx] + (int32)br[bg_idx]);
             - int32_t scaled_r_Rh_bx = (int32_t)(((tmp_r_Rh_bx * M_rRh_to_g) + rounding) >> shift_rRh_to_g);
             - int32 g_tmp_i32 = (int32)Wx[g_idx] + (int32)scaled_r_Rh_bx + (int32)bx[bg_idx]; // 候选状态计算公式
@@ -138,6 +142,7 @@ struct QuantParams {
             - const int8 g = dev::tanh_int8_lut(r_tmp_i8); // 候选状态~ht
             -
             - 如果开启训练模式: 将中间值 z, r, g 保存到v
+            - 
             - int8 h_t = (int8)z * (int8)h[output_idx] + (static_cast<int8>(1.0) - (int8)z) * (int8)g;// 当前时间步最终隐藏状态ht
             - 如果启用Zoneout: 对GRU 隐藏状态随机保留
 
@@ -170,13 +175,13 @@ host:
     float scale_Wx = ...;
     float scale_Rh = ...;
     float ratio = scale_Rh / scale_Wx;
-    int32_t N = 15;                   // 推荐经验值
+    int32_t N = 15;                   // 推荐经验值, int8 通常右移 15~20 bits, int16 可右移 22~24 bits
     int32_t M_r = int32_t(round(ratio * (1 << N)));
     int32_t shift_r = N;
     int32_t zp_r = 0;                  // 对称量化
 }
 
-__device__ __forceinline__ int8_t quantize_i32_to_int8_device(
+__device__ __forceinline__ int8_t quantize_i32_to_int8(
     const int32_t value,      // int32 累加结果
     const int32_t M,          // host 端预先计算好的整数缩放系数
     const int32_t shift,      // host 端计算好的右移位数
@@ -186,6 +191,18 @@ __device__ __forceinline__ int8_t quantize_i32_to_int8_device(
     tmp += zero_point;
     tmp = max(-128, min(127, tmp)); // clamp 到 int8
     return static_cast<int8_t>(tmp);
+}
+
+__device__ __forceinline__ int16_t quantize_i32_to_int16(
+    const int32_t value,
+    const int32_t M,
+    const int32_t shift,
+    const int32_t zero_point)
+{
+    int32_t tmp = (value * M + (1 << (shift - 1))) >> shift;
+    tmp += zero_point;
+    tmp = max(-32768, min(32767, tmp));
+    return static_cast<int16_t>(tmp);
 }
 
 host:
@@ -206,8 +223,8 @@ host:
         h_sigmoid_lut[i] = static_cast<int8_t>(roundf(s * 127.f));
         h_tanh_lut[i] = static_cast<int8_t>(roundf(t * 127.f));
     }
-    cudaMemcpyToSymbol(d_sigmoid_lut, h_sigmoid_lut, sizeof(int8_t) * 256);
-    cudaMemcpyToSymbol(d_tanh_lut,    h_tanh_lut,    sizeof(int8_t) * 256);
+    cudaMemcpyToSymbol(d_sigmoid_lut, h_sigmoid_lut, sizeof(int8_t) * 256); // 从host端拷贝到device端中编译期固定的地址
+    cudaMemcpyToSymbol(d_tanh_lut,    h_tanh_lut,    sizeof(int8_t) * 256); // 从host端拷贝到device端中编译期固定的地址
   
 }
 
@@ -219,6 +236,16 @@ __device__ __forceinline__ int8_t sigmoid_int8_lut(int8_t x, const int8_t* lut) 
 
 __device__ __forceinline__ int8_t tanh_int8_lut(int8_t x, const int8_t* lut) {
     return lut[static_cast<uint8_t>(x)];
+}
+
+__device__ __forceinline__ int8_t sigmoid_int16_lut(int16_t x, const int8_t* lut) {
+    int8_t idx = static_cast<int8_t>(x >> 8); // [-128,127]
+    return lut[static_cast<uint8_t>(idx)];
+}
+
+__device__ __forceinline__ int8_t tanh_int16_lut(int16_t x, const int8_t* lut) {
+    int8_t idx = static_cast<int8_t>(x >> 8); // [-128,127]
+    return lut[static_cast<uint8_t>(idx)];
 }
 ```
 
