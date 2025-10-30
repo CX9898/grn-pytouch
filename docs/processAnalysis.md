@@ -38,7 +38,7 @@ void ForwardPass<T, AccumT>::Run(const int steps, // 时间步数, 序列长度T
                                  AccumT *tmp_Rh,    // [N,H*3], R * h 的临时结果
                                  const float zoneout_prob, // Zoneout 概率，用于随机丢弃部分隐藏状态
                                  const T *zoneout_mask, // Zoneout mask，0/1 矩阵，控制哪些隐藏单元被保留,  // Zoneout mask [N,H]
-                                 const QuantParams &quantParams, // 形式是怎么样的? 如果内部自己算就不需要传入
+                                 const QuantParams &quantParams // 形式是怎么样的? 如果内部自己算就不需要传入
                                  ){}
 
 struct QuantParams {
@@ -113,33 +113,36 @@ struct QuantParams {
 1. 如果不是在外部传入各个scale的话, 先查找x, W, R, h的最大最小值用于计算各个scale和zero_point.
 2. 调用cuBLAS::gemm<int8>计算 (int8)W * (int8)x, 输出(int32)Wx // int8 * int8 -> int32
 3. (int32)Wx的scale_Wx = s_w * s_x. (parameter scaling)
-4. for i in 0..steps-1: 循环每个时间步
+4. for i in 0..steps-1: 循环每个时间步 (每个时间步都要更新scale, 除了W)
+    1. 先查找x, W, R, h的最大最小值用于计算各个scale和zero_point. (上一步最大最小值占比90%, 当前最大最小值占比10%)
     1. 调用cuBLAS::gemm<int8>计算 (int8)R * (int8)h, 输出(int32)Rh // int8 * int8 -> int32
     2. (int32)Rh 的 scale_Rh = scale_R * scale_h.  (parameter scaling)
     3. 执行逐元素运算(CUDA Kernel)
         1. 计算索引
         2. GRU前向计算(三个门)
             - 各个门计算前保证各个变量的scale一致. 例如:Wx: scale_Wx, Rh: scale_Rh, bx: scale_bx(通常等于 scale_Wx), br:
-              scale_br(通常等于 scale_Rh).
+              scale_br(通常等于 scale_Rh). 同一选择对其scale_Wx
             -
             - **更新门z:**
-            - int32_t Rh_aligned = (Rh[r_idx] * M_Rh_z + (1 << (shift_Rh - 1))) >> shift_Rh_z; // 对齐到 Wx 的 scale
-            - int32_t br_aligned = (br[bz_idx] * M_br_z + (1 << (shift_br - 1))) >> shift_br_z; // 对齐到 Wx 的 scale
+            - int32_t Rh_aligned = ((int32)Rh[r_idx] * M_Rh_z + (1 << (shift_Rh - 1))) >> shift_Rh_z; // 对齐到 Wx 的 scale
+            - int32_t br_aligned = ((int32)br[bz_idx] * M_br_z + (1 << (shift_br - 1))) >> shift_br_z; // 对齐到 Wx 的 scale
             - int32 z_tmp_i32 = (int32)Wx[z_idx] + (int32)Rh_aligned + (int32)bx[bz_idx] + (int32)br_aligned; // 更新门计算公式
-            - int8 z_tmp_i8 = quantize_i32_to_i8(z_tmp_i32, scale_z, zero_point_z); // 量化为int8
+            - int8 z_tmp_i8 = quantize_i32_to_int8(z_tmp_i32, ); // 量化为int8
             - const int8 z = dev::sigmoid_int8_lut(z_tmp_i8); // 更新门z
             -
             - **重置门r**
+            - // todo: scale对齐
             - int32 r_tmp_i32 = (int32)Wx[r_idx] + (int32)Rh[r_idx] + (int32)bx[br_idx] + (int32)br[br_idx]; // 重置门计算公式
-            - int8 r_tmp_i8 = quantize_i32_to_i8(r_tmp_i32, scale_r, zero_point_r); // 量化为int8
+            - int8 r_tmp_i8 = quantize_i32_to_int8(r_tmp_i32, scale_r, zero_point_r); // 量化为int8
             - const int8 r = dev::sigmoid_int8_lut(r_tmp_i8); // 重置门r
             -
             - **候选状态~ht**
+            - // todo: scale对齐
             - int64_t tmp_r_Rh_bx = (int64_t)r_int32 * (int64_t)((int32)Rh[g_idx] + (int32)br[bg_idx]);
             - int32_t scaled_r_Rh_bx = (int32_t)(((tmp_r_Rh_bx * M_rRh_to_g) + rounding) >> shift_rRh_to_g);
             - int32 g_tmp_i32 = (int32)Wx[g_idx] + (int32)scaled_r_Rh_bx + (int32)bx[bg_idx]; // 候选状态计算公式
-            - int8 g_tmp_i8 = quantize_i32_to_i8(g_tmp_i32, scale_g, zero_point_g); // 量化为int8
-            - const int8 g = dev::tanh_int8_lut(r_tmp_i8); // 候选状态~ht
+            - int8 g_tmp_i8 = quantize_i32_to_int8(g_tmp_i32, scale_g, zero_point_g); // 量化为int8
+            - const int8 g = dev::tanh_int8_lut(g_tmp_i8); // 候选状态~ht
             -
             - 如果开启训练模式: 将中间值 z, r, g 保存到v
             - 
@@ -207,9 +210,9 @@ __device__ __forceinline__ int16_t quantize_i32_to_int16(
 
 host:
 {
-    
-    全局: __constant__ int8_t d_sigmoid_lut[256];
-    全局: __constant__ int8_t d_tanh_lut[256];   
+    // 全局作用域声明
+    __constant__ int8_t d_sigmoid_lut[256]; // 全局常量
+    __constant__ int8_t d_tanh_lut[256]; // 全局常量
     
     int8_t h_sigmoid_lut[256];
     int8_t h_tanh_lut[256];
@@ -231,34 +234,43 @@ host:
 
 __device__ __forceinline__ int8_t sigmoid_int8_lut(int8_t x, const int8_t* lut) {
     // x in [-128,127], lut 长度 = 256
-    return lut[static_cast<uint8_t>(x)]; // uint8_t 转索引 [0,255]
+    const int8_t x_clamped = max(-128, min(127, x));
+    return lut[static_cast<uint8_t>(x_clamped)]; // uint8_t 转索引 [0,255]
 }
 
 __device__ __forceinline__ int8_t tanh_int8_lut(int8_t x, const int8_t* lut) {
-    return lut[static_cast<uint8_t>(x)];
+    const int8_t x_clamped = max(-128, min(127, x));
+    return lut[static_cast<uint8_t>(x_clamped)];
 }
 
-__device__ __forceinline__ int8_t sigmoid_int16_lut(int16_t x, const int8_t* lut) {
-    int8_t idx = static_cast<int8_t>(x >> 8); // [-128,127]
+__device__ __forceinline__ int8_t sigmoid_int16_lut(int16_t x, const int8_t* lut) { (TODO: 二项式拟合查表方式)
+    // 将 int16_t 范围 [-32768, 32767] 映射到 int8_t 范围 [-128, 127]
+    // 公式：idx = round( (x + 32768) * (255.0f / 65535.0f) ) - 128
+    // 整数优化：避免浮点运算，用移位实现近似缩放
+    int32_t tmp = static_cast<int32_t>(x) + 32768; // 转为 [0, 65535]
+    tmp = (tmp * 255 + 65535 / 2) / 65535; // 四舍五入缩放到 [0, 255]
+    int8_t idx = static_cast<int8_t>(tmp - 128); // 转为 [-128, 127]
     return lut[static_cast<uint8_t>(idx)];
 }
 
-__device__ __forceinline__ int8_t tanh_int16_lut(int16_t x, const int8_t* lut) {
-    int8_t idx = static_cast<int8_t>(x >> 8); // [-128,127]
-    return lut[static_cast<uint8_t>(idx)];
+__device__ __forceinline__ int8_t tanh_int16_lut(int16_t x, const int8_t* lut) { (TODO: 二项式拟合查表方式)
+    // 与 sigmoid 完全相同的索引映射逻辑
+    int32_t tmp = static_cast<int32_t>(x) + 32768; // int16_t [-32768, 32767] → [0, 65535]
+    tmp = (tmp * 255 + 65535 / 2) / 65535; // 缩放到 [0, 255]（四舍五入）
+    int8_t idx = static_cast<int8_t>(tmp - 128); // → [-128, 127]
+    return lut[static_cast<uint8_t>(idx)]; // 用索引访问 tanh LUT
 }
 ```
 
-> 需要做的:
-> - 构建quantize_i32_to_i8
-> - 构建sigmoid的定点化方法
-> - 构建tanh的定点化方法
-
 > 疑问:
-> - 量化方式选择? 对称量化; 非对称量化; 混合量化.
+> - 量化方式选择? 对称量化(权重全用对称); 非对称量化; 混合量化(V). 给定参数选择其他选择是否对称量化 
+> - > 选择混合量化. 权重使用对称量化, 其他参数则给定参数选择是否对称量化.
 > - scale是传入进来还是内部计算得到? scale = (max_float - min_float) / (max_int - min_int)
+> - > scale是内部计算
 > - scale是第一次计算好之后一直使用还是每个时间步开始前计算?
+> - > scale每个时间步都需要重新计算, 并且每个时间步的scale计算方式为: (上一步最大最小值占比90%, 当前最大最小值占比10%)
 > - 门控计算的量化步骤中, scale和zero_point的值是相同的还是根据每个门控都不同?
+> - > 每个门控的都不同
 
 ## GruTrain
 
