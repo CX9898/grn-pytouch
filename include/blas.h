@@ -86,10 +86,10 @@ inline cublasStatus_t int16_gemm_wrapper(
     );
 }
 
-//template<>
-//struct blas<int16_t> {
-//  static constexpr auto *gemm = &int16_gemm_wrapper;
-//};
+template<>
+struct blas<int16_t> {
+  static constexpr auto *gemm = &int16_gemm_wrapper;
+};
 
 template<>
 struct blas<__half> {

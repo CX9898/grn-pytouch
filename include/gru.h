@@ -6,7 +6,7 @@
 
 namespace gru {
 
-template<typename T>
+template<typename T, typename AccumT = typename std::conditional<std::is_integral<T>::value, int32_t, T>::type>
 class ForwardPass {
  public:
   // training: `true` if the caller intends to perform a backward pass to compute gradients.
@@ -56,14 +56,14 @@ class ForwardPass {
   void Iterate(
       const T *W,
       const T *R,
-      const T *bx,
-      const T *br,
+      const AccumT *bx,
+      const AccumT *br,
       const T *x,
       const T *h,
       T *h_out,
       T *v,
-      T *tmp_Wx,
-      T *tmp_Rh,
+      AccumT *tmp_Wx,
+      AccumT *tmp_Rh,
       const float zoneout_prob,
       const T *zoneout_mask);
 
@@ -71,27 +71,26 @@ class ForwardPass {
       const int steps,
       const T *W,
       const T *R,
-      const T *bx,
-      const T *br,
+      const AccumT *bx,
+      const AccumT *br,
       const T *x,
       T *h,
       T *v,
-      T *tmp_Wx,
-      T *tmp_Rh,
+      AccumT *tmp_Wx,
+      AccumT *tmp_Rh,
       const float zoneout_prob,
       const T *zoneout_mask);
 
  private:
   void IterateInternal(
       const T *R,
-      const T *bx,
-      const T *br,
+      const AccumT *bx,
+      const AccumT *br,
       const T *h,
       T *h_out,
       T *v,
-      T *tmp_Wx,
-      T *tmp_Rh,
-      int32_t *tmp_Rh_i32, // 为了储存cuBLAS的GEMM中int32输出
+      const AccumT *tmp_Wx,
+      AccumT *tmp_Rh,
       const float zoneout_prob,
       const T *zoneout_mask);
 
@@ -99,7 +98,7 @@ class ForwardPass {
   private_data *data_;
 };
 
-template<typename T>
+template<typename T, typename AccumT = typename std::conditional<std::is_integral<T>::value, int32_t, T>::type>
 class BackwardPass {
  public:
   // batch_size: the number of training inputs provided in each tensor.
@@ -157,8 +156,8 @@ class BackwardPass {
   void Iterate(
       const T *W_t,
       const T *R_t,
-      const T *bx,
-      const T *br,
+      const AccumT *bx,
+      const AccumT *br,
       const T *x_t,
       const T *h,
       const T *v,
@@ -166,8 +165,8 @@ class BackwardPass {
       T *dx,
       T *dW,
       T *dR,
-      T *dbx,
-      T *dbr,
+      AccumT *dbx,
+      AccumT *dbr,
       T *dh,
       T *dp,
       T *dq,
@@ -177,8 +176,8 @@ class BackwardPass {
       const int steps,
       const T *W_t,
       const T *R_t,
-      const T *bx,
-      const T *br,
+      const AccumT *bx,
+      const AccumT *br,
       const T *x_t,
       const T *h,
       const T *v,
@@ -186,8 +185,8 @@ class BackwardPass {
       T *dx,
       T *dW,
       T *dR,
-      T *dbx,
-      T *dbr,
+      AccumT *dbx,
+      AccumT *dbr,
       T *dh,
       T *dp,
       T *dq,
@@ -199,8 +198,8 @@ class BackwardPass {
       const T *h,
       const T *v,
       const T *dh_new,
-      T *dbx,
-      T *dbr,
+      AccumT *dbx,
+      AccumT *dbr,
       T *dh,
       T *dp,
       T *dq,
@@ -214,19 +213,5 @@ class BackwardPass {
 
 
 namespace kernel {
-template<typename T>
-__device__ __forceinline__ int8_t quantize(
-    T value,
-    T scale,
-    T zero_point
-) {
-    // value / scale + zero_point，然后 round 到最近的整数
-    T quantized = value / scale + zero_point;
-    quantized = roundf(quantized);
 
-    // 限制范围 [-128, 127] (INT8)
-    quantized = fmaxf(-128.0f, fminf(127.0f, quantized));
-
-    return static_cast<int8_t>(quantized);
-}
 }
