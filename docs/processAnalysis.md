@@ -115,17 +115,19 @@ struct QuantParams {
 3. (int32)Wx的scale_Wx = s_w * s_x. (parameter scaling)
 4. for i in 0..steps-1: 循环每个时间步 (每个时间步都要更新scale, 除了W)
     1. 先查找x, W, R, h的最大最小值用于计算各个scale和zero_point. (上一步最大最小值占比90%, 当前最大最小值占比10%)
-    1. 调用cuBLAS::gemm<int8>计算 (int8)R * (int8)h, 输出(int32)Rh // int8 * int8 -> int32
-    2. (int32)Rh 的 scale_Rh = scale_R * scale_h.  (parameter scaling)
-    3. 执行逐元素运算(CUDA Kernel)
+    2. 调用cuBLAS::gemm<int8>计算 (int8)R * (int8)h, 输出(int32)Rh // int8 * int8 -> int32
+    3. (int32)Rh 的 scale_Rh = scale_R * scale_h.  (parameter scaling)
+    4. 执行逐元素运算(CUDA Kernel)
         1. 计算索引
         2. GRU前向计算(三个门)
             - 各个门计算前保证各个变量的scale一致. 例如:Wx: scale_Wx, Rh: scale_Rh, bx: scale_bx(通常等于 scale_Wx), br:
-              scale_br(通常等于 scale_Rh). 同一选择对其scale_Wx
+              scale_br(通常等于 scale_Rh). 统一选择对其到scale_Wx
             -
             - **更新门z:**
-            - int32_t Rh_aligned = ((int32)Rh[r_idx] * M_Rh_z + (1 << (shift_Rh - 1))) >> shift_Rh_z; // 对齐到 Wx 的 scale
-            - int32_t br_aligned = ((int32)br[bz_idx] * M_br_z + (1 << (shift_br - 1))) >> shift_br_z; // 对齐到 Wx 的 scale
+            - int32_t Rh_aligned = ((int32)Rh[z_idx] * M_Rh_z + (1 << (shift_Rh - 1))) >> shift_Rh_z; // 对齐到 Wx 的
+              scale
+            - int32_t br_aligned = ((int32)br[bz_idx] * M_br_z + (1 << (shift_br - 1))) >> shift_br_z; // 对齐到 Wx 的
+              scale
             - int32 z_tmp_i32 = (int32)Wx[z_idx] + (int32)Rh_aligned + (int32)bx[bz_idx] + (int32)br_aligned; // 更新门计算公式
             - int8 z_tmp_i8 = quantize_i32_to_int8(z_tmp_i32, ); // 量化为int8
             - const int8 z = dev::sigmoid_int8_lut(z_tmp_i8); // 更新门z
@@ -145,7 +147,7 @@ struct QuantParams {
             - const int8 g = dev::tanh_int8_lut(g_tmp_i8); // 候选状态~ht
             -
             - 如果开启训练模式: 将中间值 z, r, g 保存到v
-            - 
+            -
             - int8 h_t = (int8)z * (int8)h[output_idx] + (static_cast<int8>(1.0) - (int8)z) * (int8)g;// 当前时间步最终隐藏状态ht
             - 如果启用Zoneout: 对GRU 隐藏状态随机保留
 
@@ -263,7 +265,7 @@ __device__ __forceinline__ int8_t tanh_int16_lut(int16_t x, const int8_t* lut) {
 ```
 
 > 疑问:
-> - 量化方式选择? 对称量化(权重全用对称); 非对称量化; 混合量化(V). 给定参数选择其他选择是否对称量化 
+> - 量化方式选择? 对称量化(权重全用对称); 非对称量化; 混合量化(V). 给定参数选择其他选择是否对称量化
 > - > 选择混合量化. 权重使用对称量化, 其他参数则给定参数选择是否对称量化.
 > - scale是传入进来还是内部计算得到? scale = (max_float - min_float) / (max_int - min_int)
 > - > scale是内部计算
