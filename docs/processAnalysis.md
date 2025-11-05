@@ -276,4 +276,37 @@ __device__ __forceinline__ int8_t tanh_int16_lut(int16_t x, const int8_t* lut) {
 
 ## GruTrain
 
+### **初始化**
 
+首先根据是否在内部做量化的来分支.
+
+- 如果开启内部量化: 传进来的参数则是float类型, 第一步先将每个参数进行量化(int8/int16), 计算得到Q值或scale和zp并转换成M和shift.
+- 如果不开启: 传进来的参数则是int8/int16类型, 并且还需要传入各个参数的量化参数(Q值或scale,zp或M,shift)
+
+> - x 是非对称量化.
+> - x 是每个时间步的scale不同, 也就是 x_scale[steps], x_zp[steps]. 这其中需要用(上一时间步最大最小值占比90%,
+    当前最大最小值占比10%)的做法吗?
+> - W, R, bx(偏置), br(偏置) 是对称量化
+> - W, R 中分为三个门的scale, 也就是 W_scale[3], R_scale[3]. // z, r, g
+
+### **前向传播:**
+
+1. 首先调用 cuBlas::GEMM 提前计算好 W * x.
+2. 计算 Wx_scale[steps * 3个门] 并转换成 M 和shift的形式 // 可以在初始化的阶段做, 或外部传入
+3. 由于 x 是非对称, Wx 需要进行零点补偿.
+
+   > - 首先要计算 W_sum, 也就是 W 每行的和 // 是否可以初始化的时候做, 或者外部传入
+   > - 然后遍历 Wx的所有元素, 每一行的值都要减去当前行的 x_zp * W_sum[当前行]
+
+4. for i in 0..steps-1: 循环每个时间步
+    1. 调用 cuBlas::GEMM 算好 R * h.
+    2. 执行逐元素并行运算(CUDA Kernel)
+        1. Rh_aligned_z = rescale(Rh_z); bx_aligned_z = rescale(bx_z); br_aligned_z = rescale(br_z);
+        2. const int32_t z_tmp_i32 = Wx[z_idx] + Rh_aligned_z + bx_aligned_z + br_aligned_z;
+        3. const int8_t z_tmp_i8 = dev::quantize_i32_to_i8(z_tmp_i32, rescale_Wx_z_to_z.M, rescale_Wx_z_to_z.shift);
+        4. z = dev::sigmoid_int8_lut(z_tmp_i8); // 更新门z
+
+        5.
+    3. 计算当前时间步的h的scale.
+   > - h 是对称量化?
+   > - 是不是只需要计算h的scale
