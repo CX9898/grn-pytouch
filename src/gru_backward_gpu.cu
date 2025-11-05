@@ -304,8 +304,6 @@ void BackwardPass<T, AccumT>::IterateInternal( // 内部迭代
     }
     cudaEventRecord(event, stream1);
 
-    printf("cudaError(BackwardPass:IterateInternal:gemm before): %s\n", cudaGetErrorString(cudaGetLastError()));
-
     cublasSetStream(blas_handle, stream1);
     blas<T>::gemm(blas_handle,
                   CUBLAS_OP_N, CUBLAS_OP_N,
@@ -315,8 +313,6 @@ void BackwardPass<T, AccumT>::IterateInternal( // 内部迭代
                   dq, hidden_size * 3,
                   &beta_sum,
                   dh, hidden_size);
-
-    printf("cudaError(BackwardPass:IterateInternal:gemm after): %s\n", cudaGetErrorString(cudaGetLastError()));
 }
 
 template<typename T, typename AccumT>
@@ -328,7 +324,7 @@ void BackwardPass<T, AccumT>::Run(
     const AccumT *br, // 循环bias
     const T *x_t, // 当前步输入
     const T *h, // 前一时刻隐藏状态
-    const T *v, // 前向传播中间结果(含z, r,g,h_out)
+    const T *v, // 前向传播中间缓存(含z, r,g,h_out)
     const T *dh_new, // 从后面时间步传来的梯度
     T *dx, //
     T *dW,
@@ -380,8 +376,6 @@ void BackwardPass<T, AccumT>::Run(
     // Wait for pointwise operations to complete since there's a
     // data dependency between its output (`dp`, `dq`) and the following matmuls.
     cudaStreamWaitEvent(stream2, event, 0);
-
-    printf("cudaError(BackwardPass): %s\n", cudaGetErrorString(cudaGetLastError()));
 
     cublasSetStream(blas_handle, stream2);
     blas<T>::gemm(blas_handle,

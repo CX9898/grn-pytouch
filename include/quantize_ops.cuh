@@ -6,37 +6,60 @@
 constexpr int32_t shift_Rh = 24;
 constexpr int32_t shift_br = 24;
 
-__constant__ int8_t d_sigmoid_lut[256]; // 全局常量
-__constant__ int8_t d_tanh_lut[256]; // 全局常量
+extern __constant__ int8_t d_sigmoid_lut[256]; // 全局常量
+extern __constant__ int8_t d_tanh_lut[256]; // 全局常量
 
 void initLut();
 
 namespace dev {
 
-template<bool use_inv_scale>
+__device__ __forceinline__ int8_t clamp_i8(int x) {
+    return static_cast<int8_t>(max(-128, min(127, x)));
+}
+
+__device__ __forceinline__ int8_t clamp_i16(int x) {
+    return static_cast<int8_t>(max(-32768, min(32767, x)));
+}
+
+__device__ __forceinline__ int32_t clamp_i32(long long x) {
+    // 限制到 int32_t 可表示的范围 [-2147483648, 2147483647]
+    return static_cast<int32_t>(max(-2147483648LL, min(2147483647LL, x)));
+}
+
+/**
+ * @brief 将 float 转 int8（GPU device 函数），支持 use_inv_scale 和对称量化
+ * @tparam use_inv_scale 是否使用 inv_scale（乘法而非除法）
+ * @tparam symmetric    是否使用对称量化（zero_point=0）
+ */
+template<bool use_inv_scale, bool symmetric>
 __device__ __forceinline__ int8_t quantize_float_to_int8(
     const float value,
     const float scale_param,
     const int32_t zero_point
 ) {
-    // 编译期分支：根据use_inv_scale选择计算方式(无运行时开销)
+    // 1. 编译期分支选择 scale 计算方式
     const float scaled = [value, scale_param]() {
       if constexpr (use_inv_scale) {
-          // 分支1：用inv_scale，乘法(编译期确定，仅当use_inv_scale=true时保留)
           return value * scale_param;
       } else {
-          // 分支2：用scale，除法(编译期确定，仅当use_inv_scale=false时保留)
           return value / scale_param;
       }
     }();
 
-    const float shifted = scaled + static_cast<float>(zero_point);
-    const int32_t rounded = __float2int_rn(shifted); // 四舍五入
-    const int32_t clamped = ::max(-128, ::min(127, rounded)); // 范围截断
+    // 2. 对称量化时 zero_point 固定为 0，非对称时使用传入 zero_point
+    const int32_t zp = symmetric ? 0 : zero_point;
+
+    // 3. 添加 zero_point
+    const float shifted = scaled + static_cast<float>(zp);
+
+    // 4. 四舍五入并截断到 int8 范围
+    const int32_t rounded = __float2int_rn(shifted);
+    const int32_t clamped = ::max(-128, ::min(127, rounded));
+
     return static_cast<int8_t>(clamped);
 }
 
-__device__ __forceinline__ int16_t quantize_i32_to_i8(
+__device__ __forceinline__ int8_t quantize_i32_to_i8(
     const int32_t value,
     const int32_t M,
     const int32_t shift,
@@ -44,14 +67,14 @@ __device__ __forceinline__ int16_t quantize_i32_to_i8(
     int32_t tmp = (value * M + (1 << (shift - 1))) >> shift;
     tmp += zero_point;
     tmp = max(-128, min(127, tmp));
-    return static_cast<int16_t>(tmp);
+    return static_cast<int8_t>(tmp);
 }
 
 __device__ __forceinline__ int16_t quantize_i32_to_i16(
     const int32_t value,
     const int32_t M,
     const int32_t shift,
-    const int32_t zero_point = 0) {
+    const int32_t zero_point) {
     int32_t tmp = (value * M + (1 << (shift - 1))) >> shift;
     tmp += zero_point;
     tmp = max(-32768, min(32767, tmp));
@@ -77,6 +100,11 @@ __device__ __forceinline__ int8_t sigmoid_int16_lut(int16_t x) { // (TODO: 二�
     tmp = (tmp * 255 + 65535 / 2) / 65535; // 四舍五入缩放到 [0, 255]
     int8_t idx = static_cast<int8_t>(tmp - 128); // 转为 [-128, 127]
     return d_sigmoid_lut[static_cast<uint8_t>(idx)];
+
+    // -10到10分成N32段, 每段用二次多项式拟合
+
+    // PDQ
+    // QAT 训练
 }
 
 __device__ __forceinline__ int8_t tanh_int16_lut(int16_t x) { // (TODO: 二项式拟合查表方式)
@@ -130,21 +158,107 @@ __device__ __forceinline__ int32_t rescale(
     return scaled;
 }
 
-} // dev namespace
-
 template<typename T>
-void calculateScaleZeroPoint(const T *dev_data, size_t size, float &scale, T &zero_point);
+struct QuantLimits;
 
-// Rescale 参数结构体（含义清楚）
-struct RescaleParam {
-  int32_t M;  // M, 整数乘法系数，对齐到目标 scale 使用
-  int shift;         // shift, 右移位数，用于 CUDA kernel
+template<>
+struct QuantLimits<int8_t> {
+  static __device__ __forceinline__ constexpr int32_t min()  { return -128; }
+
+  static __device__ __forceinline__ constexpr int32_t max() { return 127; }
+};
+
+template<>
+struct QuantLimits<int16_t> {
+  static __device__ __forceinline__ constexpr int32_t min() { return -32768; }
+
+  static __device__ __forceinline__ constexpr int32_t max() { return 32767; }
+};
+
+// int32_t 特化
+template<>
+struct QuantLimits<int32_t> {
+  static __host__ __device__ constexpr int min() { return -2147483648; }
+  static __host__ __device__ constexpr int max() { return 2147483647; }
 };
 
 /**
- * @param src_scale     源张量的量化 scale (float)
- * @param dst_scale     目标张量的量化 scale (float)
- * @param fixed_shift   固定的右移位数，用于 kernel 右移，默认 15
- * @return RescaleParam 包含整数 multiplier 和 kernel 右移 shift
+ * @brief 在 GPU 上将 float 数据量化为 int8
+ * @tparam QuantT       目标量化类型（int8_t 或 int16_t）
+ * @tparam use_inv_scale 是否使用 inv_scale（乘法而非除法）
+ * @tparam symmetric    是否使用对称量化（zero_point=0）
+ * @tparam clamp    是否使用饱和处理 (对bias不处理)
+ * @param src_dev    输入 float 指针（GPU 内存）
+ * @param dst_dev    输出 int8 指针（GPU 内存）
+ * @param size       元素数量
+ * @param scale      量化 scale
+ * @param zero_point 量化 zero_point（非对称量化有效）
  */
-inline RescaleParam computeRescaleParamFixedShift(float src_scale, float dst_scale, int fixed_shift = 15);
+template<typename QuantT, bool use_inv_scale, bool symmetric, bool clamp = true>
+__global__ void quantizeFloatToInt(
+    const float *src_dev,
+    QuantT *dst_dev,
+    size_t size,
+    float scale,
+    int32_t zero_point) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+
+
+    // -----------------------------
+    // 1. 编译期分支选择 scale 计算方式
+    // -----------------------------
+    float scaled;
+    if constexpr (use_inv_scale) {
+        scaled = src_dev[idx] * scale; // 编译期保留
+    } else {
+        scaled = src_dev[idx] / scale; // 编译期保留
+    }
+
+    // -----------------------------
+    // 2. 对称量化无需 zero_point，非对称量化加上 zero_point
+    // -----------------------------
+    if constexpr (!symmetric) {
+        scaled += zero_point;
+    }
+
+    // -----------------------------
+    // 3. 四舍五入并截断到 int8 范围
+    // -----------------------------
+    int32_t rounded = __float2int_rn(scaled);
+
+    if constexpr (clamp) {
+        constexpr int32_t qmin = QuantLimits<QuantT>::min();
+        constexpr int32_t qmax = QuantLimits<QuantT>::max();
+        rounded = min(max(rounded, qmin), qmax);
+    }
+
+    dst_dev[idx] = static_cast<int8_t>(rounded);
+}
+
+} // dev namespace
+
+
+
+
+//template<typename T>
+//void calculateScaleZeroPoint(const T *dev_ptr, size_t size, float &scale, int32_t &zero_point) {
+//
+//    auto max_it = thrust::max_element(dev_ptr, dev_ptr + size);
+//    auto min_it = thrust::min_element(dev_ptr, dev_ptr + size);
+//
+//    T max_val, min_val;
+//    thrust::copy(max_it, max_it + 1, &max_val);
+//    thrust::copy(min_it, min_it + 1, &min_val);
+//
+//    constexpr int32_t int_min = std::numeric_limits<T>::min();
+//    constexpr int32_t int_max = std::numeric_limits<T>::max();
+//
+//    // scale计算
+//    scale = static_cast<float>(max_val - min_val) / static_cast<float>(int_max - int_min);
+//    if (scale == 0.f) scale = 1e-8f;
+//
+//    // zero-point
+//    int32_t zp_temp = static_cast<int32_t>(std::round(-static_cast<float>(min_val) / scale)) + int_min;
+//    zero_point = std::clamp(zp_temp, int_min, int_max);
+//}

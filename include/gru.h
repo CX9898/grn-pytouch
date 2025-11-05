@@ -2,7 +2,9 @@
 
 #include <cublas_v2.h>
 #include <cuda_runtime_api.h>
+#include <optional>
 
+#include "quantize_ops_helper.hpp"
 
 namespace gru {
 
@@ -25,6 +27,11 @@ class ForwardPass {
   // Releases internal resources.
   // Blocks until all iterations have completed executing on the GPU.
   ~ForwardPass();
+
+  void SetQuantParams(const QuantParams &qp) {
+      quantize_params_ = qp;
+      quantize_enabled_ = true;
+  }
 
   // Performs one forward iteration of the GRU cell.
   //
@@ -65,7 +72,8 @@ class ForwardPass {
       AccumT *tmp_Wx,
       AccumT *tmp_Rh,
       const float zoneout_prob,
-      const T *zoneout_mask);
+      const T *zoneout_mask,
+      const RescaleParamsPerStep &rescaleParams);
 
   void Run(
       const int steps,
@@ -79,7 +87,8 @@ class ForwardPass {
       AccumT *tmp_Wx,
       AccumT *tmp_Rh,
       const float zoneout_prob,
-      const T *zoneout_mask);
+      const T *zoneout_mask,
+      const std::optional<GruQuantScales> &gruQuantParams = std::nullopt);
 
  private:
   void IterateInternal(
@@ -92,10 +101,14 @@ class ForwardPass {
       const AccumT *tmp_Wx,
       AccumT *tmp_Rh,
       const float zoneout_prob,
-      const T *zoneout_mask);
+      const T *zoneout_mask,
+      const RescaleParamsPerStep &rescaleParamsPer);
 
   struct private_data;
   private_data *data_;
+
+  QuantParams quantize_params_;
+  bool quantize_enabled_ = false;
 };
 
 template<typename T, typename AccumT = typename std::conditional<std::is_integral<T>::value, int32_t, T>::type>
@@ -210,8 +223,3 @@ class BackwardPass {
 };
 
 }  // namespace gru
-
-
-namespace kernel {
-
-}
