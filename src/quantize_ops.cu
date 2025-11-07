@@ -30,7 +30,7 @@ void quantizeFloatToInt(const float *src_dev,
     uint32_t block = 512;
     uint32_t grid = (size + block - 1) / block;
 
-    dev::quantizeFloatToInt<QuantT, use_inv_scale, symmetric>
+    dev::quantizeFloatToInt<QuantT, use_inv_scale, symmetric, clamp>
     <<<grid, block>>>(src_dev, dst_dev, size, scale, zero_point);
 }
 
@@ -51,6 +51,55 @@ template void quantizeFloatToInt<int32_t, true, true, false>(const float *src_de
                                                              uint32_t size,
                                                              float scale,
                                                              int32_t zero_point);
+
+template void quantizeFloatToInt<int32_t, false, false, true>(const float *src_dev,
+                                                              int32_t *dst_dev,
+                                                              uint32_t size,
+                                                              float scale,
+                                                              int32_t zero_point);
+
+
+/**
+ * @brief 在 GPU 上将 float 数据量化为 int8/int16（支持每个时间步独立 scale）
+ * @tparam QuantT       目标量化类型（int8_t 或 int16_t）
+ * @tparam use_inv_scale 是否使用 inv_scale（乘法而非除法）
+ * @tparam symmetric    是否使用对称量化（zero_point=0）
+ * @tparam clamp        是否使用饱和处理
+ * @param src_dev       输入 float 指针（GPU 内存）
+ * @param dst_dev       输出 int8/int16 指针（GPU 内存）
+ * @param size          总元素数量
+ * @param scale_per_t   每个时间步的量化 scale 数组（GPU 内存，长度为 time_steps）
+ * @param zero_point_per_t    每个时间步的量化 zero_point（非对称量化有效）
+ * @param time_step_size 每个时间步的元素数（例如 batch_size * input_dim）
+ */
+template<typename QuantT, bool use_inv_scale, bool symmetric, bool clamp>
+void quantizeFloatToIntPerStep(const float *src_dev,
+                               QuantT *dst_dev,
+                               size_t size,
+                               const float *scale_per_t,
+                               const int32_t *zero_point_per_t,
+                               int time_step_size) {
+    uint32_t block = 512;
+    uint32_t grid = (size + block - 1) / block;
+
+    dev::quantizeFloatToIntPerStep<QuantT, use_inv_scale, symmetric, clamp>
+    <<<grid, block>>>(src_dev, dst_dev, size, scale_per_t, zero_point_per_t, time_step_size);
+}
+
+template void quantizeFloatToIntPerStep<int8_t, false, false, true>(const float *src_dev,
+                                                                    int8_t *dst_dev,
+                                                                    size_t size,
+                                                                    const float *scale_per_t,
+                                                                    const int32_t *zero_point_per_t,
+                                                                    int time_step_size);
+
+template void quantizeFloatToIntPerStep<int16_t, false, false, true>(const float *src_dev,
+                                                                     int16_t *dst_dev,
+                                                                     size_t size,
+                                                                     const float *scale_per_t,
+                                                                     const int32_t *zero_point_per_t,
+                                                                     int time_step_size);
+
 
 void initLut() {
     int8_t h_sigmoid_lut[256];
@@ -293,8 +342,10 @@ GruQuantScales computeGruQuantParams(const float *x, int steps, int N, int C,
     GruQuantScales q;
 
     // 计算输入 x 的 scale/zp
+    q.x_scale.resize(steps);
+    q.x_zp.resize(steps);
     for (int i = 0; i < steps; ++i) {
-        calculateScaleZeroPoint<QuantT>(x + i * N * C, i * N * C, q.x[i].scale, q.x[i].zero_point);
+        calculateScaleZeroPoint<QuantT>(x + i * N * C, N * C, q.x_scale[i], q.x_zp[i]);
     }
 
     // W 分片: [C, H*3] → 每 H 对应一个门
@@ -318,11 +369,12 @@ GruQuantScales computeGruQuantParams(const float *x, int steps, int N, int C,
 
 
     // 计算Wx scale
+    q.Wx.resize(steps);
 #pragma omp parallel for
     for (int t = 0; t < steps; ++t) {
         for (int g = 0; g < 3; ++g) {
             // --- Wx[t] = x[t] * W ---
-            q.Wx[t].gate[g].scale = q.x[t].scale * q.W.gate[g].scale;
+            q.Wx[t].gate[g].scale = q.x_scale[t] * q.W.gate[g].scale;
             q.Wx[t].gate[g].zero_point = 0;
         }
     }
@@ -366,7 +418,7 @@ template GruQuantScales computeGruQuantParams<int32_t>(const float *x, int steps
  */
 void computeWxRescaleParamsFixedShift(
     int steps,
-    const std::vector<QuantParams> &x_scales,
+    const std::vector<float> &x_scales,
     const float w_scale_z,
     const float w_scale_r,
     const float w_scale_g,
@@ -377,9 +429,9 @@ void computeWxRescaleParamsFixedShift(
 
     for (int t = 0; t < steps; ++t) {
         // ---------- 计算每步的浮点 scale ----------
-        float scale_z = x_scales[t].scale * w_scale_z;
-        float scale_r = x_scales[t].scale * w_scale_r;
-        float scale_g = x_scales[t].scale * w_scale_g;
+        float scale_z = x_scales[t] * w_scale_z;
+        float scale_r = x_scales[t] * w_scale_r;
+        float scale_g = x_scales[t] * w_scale_g;
 
         const float scales[3] = {scale_z, scale_r, scale_g};
 

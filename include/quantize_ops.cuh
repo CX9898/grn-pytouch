@@ -13,17 +13,17 @@ void initLut();
 
 namespace dev {
 
-__device__ __forceinline__ int8_t clamp_i8(int x) {
+template<typename T>
+__device__ __forceinline__ T clamp(int x);
+
+template<>
+__device__ __forceinline__ int8_t clamp(int x) {
     return static_cast<int8_t>(max(-128, min(127, x)));
 }
 
-__device__ __forceinline__ int8_t clamp_i16(int x) {
+template<>
+__device__ __forceinline__ int16_t clamp(int x) {
     return static_cast<int8_t>(max(-32768, min(32767, x)));
-}
-
-__device__ __forceinline__ int32_t clamp_i32(long long x) {
-    // 限制到 int32_t 可表示的范围 [-2147483648, 2147483647]
-    return static_cast<int32_t>(max(-2147483648LL, min(2147483647LL, x)));
 }
 
 /**
@@ -163,7 +163,7 @@ struct QuantLimits;
 
 template<>
 struct QuantLimits<int8_t> {
-  static __device__ __forceinline__ constexpr int32_t min()  { return -128; }
+  static __device__ __forceinline__ constexpr int32_t min() { return -128; }
 
   static __device__ __forceinline__ constexpr int32_t max() { return 127; }
 };
@@ -179,8 +179,50 @@ struct QuantLimits<int16_t> {
 template<>
 struct QuantLimits<int32_t> {
   static __host__ __device__ constexpr int min() { return -2147483648; }
+
   static __host__ __device__ constexpr int max() { return 2147483647; }
 };
+
+/**
+ * @brief 对单个 float 元素执行量化 (设备端函数)
+ * @tparam QuantT       目标量化类型（int8_t 或 int16_t）
+ * @tparam use_inv_scale 是否使用 inv_scale（乘法而非除法）
+ * @tparam symmetric    是否使用对称量化（zero_point=0）
+ * @tparam clamp        是否使用饱和处理
+ * @param x             输入值（float）
+ * @param scale         当前 scale
+ * @param zero_point    zero_point（仅非对称量化有效）
+ * @return 量化后的整数值 (QuantT)
+ */
+template<typename QuantT, bool use_inv_scale, bool symmetric, bool clamp = true>
+__device__ __forceinline__ QuantT quantizeElement(
+    float x,
+    float scale,
+    int32_t zero_point) {
+
+    // 1. scale 运算
+    float scaled;
+    if constexpr (use_inv_scale)
+        scaled = x * scale;
+    else
+        scaled = x / scale;
+
+    // 2. zero_point (仅非对称)
+    if constexpr (!symmetric)
+        scaled += zero_point;
+
+    // 3. 四舍五入
+    int32_t rounded = __float2int_rn(scaled);
+
+    // 4. 饱和裁剪
+    if constexpr (clamp) {
+        constexpr int32_t qmin = QuantLimits<QuantT>::min();
+        constexpr int32_t qmax = QuantLimits<QuantT>::max();
+        rounded = min(max(rounded, qmin), qmax);
+    }
+
+    return static_cast<QuantT>(rounded);
+}
 
 /**
  * @brief 在 GPU 上将 float 数据量化为 int8
@@ -204,36 +246,44 @@ __global__ void quantizeFloatToInt(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
 
+    // 调用 device 函数执行单元素量化
+    dst_dev[idx] = quantizeElement<QuantT, use_inv_scale, symmetric, clamp>(
+        src_dev[idx], scale, zero_point);
+}
 
-    // -----------------------------
-    // 1. 编译期分支选择 scale 计算方式
-    // -----------------------------
-    float scaled;
-    if constexpr (use_inv_scale) {
-        scaled = src_dev[idx] * scale; // 编译期保留
-    } else {
-        scaled = src_dev[idx] / scale; // 编译期保留
-    }
+/**
+ * @brief 在 GPU 上将 float 数据量化为 int8/int16（支持每个时间步独立 scale）
+ * @tparam QuantT       目标量化类型（int8_t 或 int16_t）
+ * @tparam use_inv_scale 是否使用 inv_scale（乘法而非除法）
+ * @tparam symmetric    是否使用对称量化（zero_point=0）
+ * @tparam clamp        是否使用饱和处理
+ * @param src_dev       输入 float 指针（GPU 内存）
+ * @param dst_dev       输出 int8/int16 指针（GPU 内存）
+ * @param size          总元素数量
+ * @param scale_per_t   每个时间步的量化 scale 数组（GPU 内存，长度为 time_steps）
+ * @param zero_point    量化 zero_point（非对称量化有效）
+ * @param time_step_size 每个时间步的元素数（例如 batch_size * input_dim）
+ */
+template<typename QuantT, bool use_inv_scale, bool symmetric, bool clamp = true>
+__global__ void quantizeFloatToIntPerStep(
+    const float *src_dev,
+    QuantT *dst_dev,
+    size_t size,
+    const float *scale_per_t,
+    const int32_t *zero_point_per_t,
+    int time_step_size) {
 
-    // -----------------------------
-    // 2. 对称量化无需 zero_point，非对称量化加上 zero_point
-    // -----------------------------
-    if constexpr (!symmetric) {
-        scaled += zero_point;
-    }
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
 
-    // -----------------------------
-    // 3. 四舍五入并截断到 int8 范围
-    // -----------------------------
-    int32_t rounded = __float2int_rn(scaled);
+    // 当前时间步
+    int t = idx / time_step_size;
+    const float scale = scale_per_t[t];
+    const int32_t zero_point = zero_point_per_t[t];
 
-    if constexpr (clamp) {
-        constexpr int32_t qmin = QuantLimits<QuantT>::min();
-        constexpr int32_t qmax = QuantLimits<QuantT>::max();
-        rounded = min(max(rounded, qmin), qmax);
-    }
-
-    dst_dev[idx] = static_cast<int8_t>(rounded);
+    // 调用 device 函数执行单元素量化
+    dst_dev[idx] = quantizeElement<QuantT, use_inv_scale, symmetric, clamp>(
+        src_dev[idx], scale, zero_point);
 }
 
 } // dev namespace

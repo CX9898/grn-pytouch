@@ -12,7 +12,8 @@ struct QuantParams3 { // 对应三个门: z, r, g
 };
 
 struct GruQuantScales {
-  std::vector<QuantParams> x;  // 每步一组 scale/zp，非对称
+  std::vector<float> x_scale;  // 每步一组 scale/zp，非对称
+  std::vector<int32_t> x_zp;
 
   QuantParams3 W; // 分为三个门: z, r, g
   QuantParams3 R; // 分为三个门: z, r, g
@@ -153,6 +154,27 @@ void quantizeFloatToInt(const float *src_dev,
                         float scale,
                         int32_t zero_point = 0);
 
+/**
+ * @brief 在 GPU 上将 float 数据量化为 int8/int16（支持每个时间步独立 scale）
+ * @tparam QuantT       目标量化类型（int8_t 或 int16_t）
+ * @tparam use_inv_scale 是否使用 inv_scale（乘法而非除法）
+ * @tparam symmetric    是否使用对称量化（zero_point=0）
+ * @tparam clamp        是否使用饱和处理
+ * @param src_dev       输入 float 指针（GPU 内存）
+ * @param dst_dev       输出 int8/int16 指针（GPU 内存）
+ * @param size          总元素数量
+ * @param scale_per_t   每个时间步的量化 scale 数组（GPU 内存，长度为 time_steps）
+ * @param zero_point    每个时间步的量化 zero_point（非对称量化有效）
+ * @param time_step_size 每个时间步的元素数（例如 batch_size * input_dim）
+ */
+template<typename QuantT, bool use_inv_scale, bool symmetric, bool clamp = true>
+void quantizeFloatToIntPerStep(const float *src_dev,
+                               QuantT *dst_dev,
+                               size_t size,
+                               const float *scale_per_t,
+                               const int32_t *zero_point_per_t,
+                               int time_step_size);
+
 void computeWeightSum(
     const int8_t *W_q,// [out_dim, in_dim] 权重量化矩阵
     int32_t *weight_sum,// [out_dim] 输出数组
@@ -180,7 +202,7 @@ void applyZeroPointCompensation2D(
  */
 void computeWxRescaleParamsFixedShift(
     int steps,
-    const std::vector<QuantParams> &x_scales,
+    const std::vector<float> &x_scales,
     const float w_scale_z,
     const float w_scale_r,
     const float w_scale_g,

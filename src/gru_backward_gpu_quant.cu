@@ -1,9 +1,10 @@
 #include <cublas_v2.h>
 #include <cuda_runtime_api.h>
+#include <cstdio>
 
 #include "blas.h"
 #include "device_assert.h"
-#include "gru.h"
+#include "gru_quant.h"
 #include "inline_ops.h"
 
 namespace {
@@ -12,15 +13,15 @@ template<typename T, bool ApplyZoneout>
 __global__
 void PointwiseOperations(const int batch_dim,
                          const int hidden_dim,
-                         const T* h,
-                         const T* v,
-                         const T* dh_new,
-                         T* dbx_out,
-                         T* dbr_out,
-                         T* dh_inout,
-                         T* dp_out,
-                         T* dq_out,
-                         const T* zoneout_mask) {  // Zoneout mask (only used if ApplyZoneout==true)
+                         const T *h,
+                         const T *v,
+                         const T *dh_new,
+                         int32_t *dbx_out,
+                         int32_t *dbr_out,
+                         T *dh_inout,
+                         T *dp_out,
+                         T *dq_out,
+                         const T *zoneout_mask) {  // Zoneout mask (only used if ApplyZoneout==true)
     const int row = blockDim.x * blockIdx.x + threadIdx.x;
     const int col = blockDim.y * blockIdx.y + threadIdx.y;
 
@@ -81,21 +82,23 @@ void PointwiseOperations(const int batch_dim,
 }
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+
 template<typename T, bool ApplyZoneout>
 __global__
 void PointwiseOperations(const int batch_dim,
                          const int hidden_dim,
-                         const half* h,
-                         const half* v,
-                         const half* dh_new,
-                         half* dbx_out,
-                         half* dbr_out,
-                         half* dh_inout,
-                         half* dp_out,
-                         half* dq_out,
-                         const half* zoneout_mask) {
+                         const half *h,
+                         const half *v,
+                         const half *dh_new,
+                         half *dbx_out,
+                         half *dbr_out,
+                         half *dh_inout,
+                         half *dp_out,
+                         half *dq_out,
+                         const half *zoneout_mask) {
     device_assert_fail("FP16 is not supported on compute capability < 7.0.");
 }
+
 #endif
 
 }  // anonymous namespace
@@ -103,7 +106,7 @@ void PointwiseOperations(const int batch_dim,
 namespace gru {
 
 template<typename T>
-struct BackwardPass<T>::private_data {
+struct BackwardPassQuant<T>::private_data {
   int batch_size;
   int input_size;
   int hidden_size;
@@ -114,12 +117,12 @@ struct BackwardPass<T>::private_data {
 };
 
 template<typename T>
-BackwardPass<T>::BackwardPass(
+BackwardPassQuant<T>::BackwardPassQuant(
     const int batch_size,
     const int input_size,
     const int hidden_size,
-    const cublasHandle_t& blas_handle,
-    const cudaStream_t& stream) : data_(new private_data) {
+    const cublasHandle_t &blas_handle,
+    const cudaStream_t &stream) : data_(new private_data) {
     data_->batch_size = batch_size;
     data_->input_size = input_size;
     data_->hidden_size = hidden_size;
@@ -131,7 +134,7 @@ BackwardPass<T>::BackwardPass(
 }
 
 template<typename T>
-BackwardPass<T>::~BackwardPass() {
+BackwardPassQuant<T>::~BackwardPassQuant() {
     if (data_->sync_stream) {
         cudaEventRecord(data_->event, data_->stream[1]);
         cudaStreamWaitEvent(data_->sync_stream, data_->event, 0);
@@ -148,29 +151,34 @@ BackwardPass<T>::~BackwardPass() {
 }
 
 template<typename T>
-void BackwardPass<T>::Iterate(
-    const T* W_t,     // [H*3,C]
-    const T* R_t,     // [H*3,H]
-    const T* bx,      // [H*3]
-    const T* br,      // [H*3]
-    const T* x_t,     // [C,N]
-    const T* h,       // [N,H]
-    const T* v,       // [N,H*4]
-    const T* dh_new,  // [N,H]
-    T* dx,            // [N,C]
-    T* dW,            // [C,H*3]
-    T* dR,            // [H,H*3]
-    T* dbx,           // [H*3]
-    T* dbr,           // [H*3]
-    T* dh,            // [N,H]
-    T* dp,            // [N,H*3]
-    T* dq,            // [N,H*3]
-    const T* zoneout_mask) {  // [N,H]
+void BackwardPassQuant<T>::Iterate(
+    const T *W_t,     // [H*3,C]
+    const T *R_t,     // [H*3,H]
+    const int32_t *bx,      // [H*3]
+    const int32_t *br,      // [H*3]
+    const T *x_t,     // [C,N]
+    const T *h,       // [N,H]
+    const T *v,       // [N,H*4]
+    const T *dh_new,  // [N,H]
+    T *dx,            // [N,C]
+    T *dW,            // [C,H*3]
+    T *dR,            // [H,H*3]
+    int32_t *dbx,           // [H*3]
+    int32_t *dbr,           // [H*3]
+    T *dh,            // [N,H]
+    T *dp,            // [N,H*3]
+    T *dq,            // [N,H*3]
+    const T *zoneout_mask) {  // [N,H]
     const blas<void>::set_pointer_mode scoped1(data_->blas_handle);
 
-    const T alpha = static_cast<T>(1.0);
-    const T beta_sum = static_cast<T>(1.0);
-    const T beta_assign = static_cast<T>(0.0);
+    using alpha_beta_t = std::conditional_t<
+        std::is_same_v<T, int8_t> || std::is_same_v<T, int16_t>,
+        int,
+        T>;
+
+    static const alpha_beta_t alpha = static_cast<alpha_beta_t>(1.0);
+    static const alpha_beta_t beta_sum = static_cast<alpha_beta_t>(1.0);
+    static const alpha_beta_t beta_assign = static_cast<alpha_beta_t>(0.0);
 
     const int batch_size = data_->batch_size;
     const int hidden_size = data_->hidden_size;
@@ -233,19 +241,25 @@ void BackwardPass<T>::Iterate(
 }
 
 template<typename T>
-void BackwardPass<T>::IterateInternal(
-    const T* R_t,     // [H*3,H]
-    const T* h,       // [N,H]
-    const T* v,       // [N,H*4]
-    const T* dh_new,  // [N,H]
-    T* dbx,           // [H*3]
-    T* dbr,           // [H*3]
-    T* dh,            // [N,H]
-    T* dp,            // [N,H*3]
-    T* dq,            // [N,H*3]
-    const T* zoneout_mask) {  // [N,H]
-    const T alpha = static_cast<T>(1.0);
-    const T beta_sum = static_cast<T>(1.0);
+void BackwardPassQuant<T>::IterateInternal( // 内部迭代
+    const T *R_t,     // [H*3,H]
+    const T *h,       // [N,H]
+    const T *v,       // [N,H*4]
+    const T *dh_new,  // [N,H]
+    int32_t *dbx,           // [H*3]
+    int32_t *dbr,           // [H*3]
+    T *dh,            // [N,H]
+    T *dp,            // [N,H*3]
+    T *dq,            // [N,H*3]
+    const T *zoneout_mask) {  // [N,H]
+
+    using alpha_beta_t = std::conditional_t<
+        std::is_same_v<T, int8_t> || std::is_same_v<T, int16_t>,
+        int,
+        T>;
+
+    static const alpha_beta_t alpha = static_cast<alpha_beta_t>(1.0);
+    static const alpha_beta_t beta_sum = static_cast<alpha_beta_t>(1.0);
 
     const int batch_size = data_->batch_size;
     const int hidden_size = data_->hidden_size;
@@ -290,7 +304,7 @@ void BackwardPass<T>::IterateInternal(
     }
     cudaEventRecord(event, stream1);
 
-    cublasSetStream(blas_handle,  stream1);
+    cublasSetStream(blas_handle, stream1);
     blas<T>::gemm(blas_handle,
                   CUBLAS_OP_N, CUBLAS_OP_N,
                   hidden_size, batch_size, hidden_size * 3,
@@ -302,31 +316,36 @@ void BackwardPass<T>::IterateInternal(
 }
 
 template<typename T>
-void BackwardPass<T>::Run(
+void BackwardPassQuant<T>::Run(
     const int steps,
-    const T* W_t,
-    const T* R_t,
-    const T* bx,
-    const T* br,
-    const T* x_t,
-    const T* h,
-    const T* v,
-    const T* dh_new,
-    T* dx,
-    T* dW,
-    T* dR,
-    T* dbx,
-    T* dbr,
-    T* dh,
-    T* dp,
-    T* dq,
-    const T* zoneout_mask) {
+    const T *W_t, // 输入权重转置
+    const T *R_t, // 循环权重转置
+    const int32_t *bx, // 输入bias
+    const int32_t *br, // 循环bias
+    const T *x_t, // 当前步输入
+    const T *h, // 前一时刻隐藏状态
+    const T *v, // 前向传播中间缓存(含z, r,g,h_out)
+    const T *dh_new, // 从后面时间步传来的梯度
+    T *dx, //
+    T *dW,
+    T *dR,
+    int32_t *dbx,
+    int32_t *dbr,
+    T *dh,
+    T *dp,
+    T *dq,
+    const T *zoneout_mask) {
     const blas<void>::enable_tensor_cores scoped0(data_->blas_handle);
     const blas<void>::set_pointer_mode scoped1(data_->blas_handle);
 
-    const T alpha = static_cast<T>(1.0);
-    const T beta_sum = static_cast<T>(1.0);
-    const T beta_assign = static_cast<T>(0.0);
+    using alpha_beta_t = std::conditional_t<
+        std::is_same_v<T, int8_t> || std::is_same_v<T, int16_t>,
+        int,
+        T>;
+
+    const alpha_beta_t alpha = static_cast<alpha_beta_t>(1.0);
+    const alpha_beta_t beta_sum = static_cast<alpha_beta_t>(1.0);
+    const alpha_beta_t beta_assign = static_cast<alpha_beta_t>(0.0);
 
     const int batch_size = data_->batch_size;
     const int input_size = data_->input_size;
@@ -340,7 +359,7 @@ void BackwardPass<T>::Run(
     cublasGetStream(blas_handle, &save_stream);
 
     const int NH = batch_size * hidden_size;
-    for (int i = steps - 1; i >= 0; --i) {
+    for (int i = steps - 1; i >= 0; --i) { // 反向迭代
         IterateInternal(
             R_t,
             h + i * NH,
@@ -351,7 +370,7 @@ void BackwardPass<T>::Run(
             dh,
             dp + i * NH * 3,
             dq + i * NH * 3,
-            zoneout_mask ? zoneout_mask + i * NH : nullptr );
+            zoneout_mask ? zoneout_mask + i * NH : nullptr);
     }
 
     // Wait for pointwise operations to complete since there's a
@@ -391,8 +410,11 @@ void BackwardPass<T>::Run(
     cublasSetStream(blas_handle, save_stream);
 }
 
-template struct BackwardPass<half>;
-template struct BackwardPass<float>;
-template struct BackwardPass<double>;
+template
+struct BackwardPassQuant<int8_t>;
+template
+struct BackwardPassQuant<int16_t>;
 
 }  // namespace gru
+
+
