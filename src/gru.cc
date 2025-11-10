@@ -406,7 +406,6 @@ void checkHQuantizationWithCosine(
         float max_diff = 0.0f;
         float sum_diff = 0.0f;
 
-
         int count = 0;
         for (int idx = 0; idx < size_per_step; ++idx) {
             float diff = std::abs(h_float_step[idx] - h_quant_step[idx]);

@@ -12,6 +12,7 @@
 #include "device_ptr.h"
 #include "quantize_ops.cuh"
 #include "quantize_ops_helper.hpp"
+#include "devVector.cuh"
 
 namespace kernel {
 
@@ -392,8 +393,6 @@ void ForwardPassQuant<T>::Run(const int steps, // 时间步数, 序列长度T
     const cublasHandle_t blas_handle = data_->blas_handle;
     const cudaStream_t stream2 = data_->stream[1];
     const cudaEvent_t event = data_->event;
-
-    // TODO: 尝试手写GEMM, 融合补偿x_zp[steps].
 
     cudaStream_t save_stream;
     cublasGetStream(blas_handle, &save_stream);
