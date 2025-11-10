@@ -1,26 +1,11 @@
-// Copyright 2020 LMNT, Inc. All Rights Reserved.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//    http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-// ==============================================================================
-
 #include <cublas_v2.h>
 #include <cuda_runtime_api.h>
 #include <cuda_fp16.h>
 
 #include "blas.h"
 #include "device_assert.h"
-#include "inline_ops.h"
 #include "gru.h"
+#include "inline_ops.h"
 
 namespace {
 
@@ -58,9 +43,9 @@ void PointwiseOperations(const int batch_dim,
     const int br_idx = row + 1 * hidden_dim;
     const int bg_idx = row + 2 * hidden_dim;
 
-    const T z = dev::sigmoid(Wx[z_idx] + Rh[z_idx] + bx[bz_idx] + br[bz_idx]);
-    const T r = dev::sigmoid(Wx[r_idx] + Rh[r_idx] + bx[br_idx] + br[br_idx]);
-    const T g = dev::tanh(Wx[g_idx] + r * (Rh[g_idx] + br[bg_idx]) + bx[bg_idx]);
+    const T z = sigmoid(Wx[z_idx] + Rh[z_idx] + bx[bz_idx] + br[bz_idx]);
+    const T r = sigmoid(Wx[r_idx] + Rh[r_idx] + bx[br_idx] + br[br_idx]);
+    const T g = tanh(Wx[g_idx] + r * (Rh[g_idx] + br[bg_idx]) + bx[bg_idx]);
 
     // Store internal activations if we're eventually going to backprop.
     if (Training) {

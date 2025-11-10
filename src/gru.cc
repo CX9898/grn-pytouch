@@ -79,16 +79,14 @@ void GruQuantInit(
     const int input_size = x.dimension(0);
     const int hidden_size = R.dimension(1);
 
+    // N : batch_size
+    // C : input_size
     if (!use_int16) { // int8量化
         gruQuantScales = computeGruQuantParams<int8_t>(
             x.data(), time_steps, batch_size, input_size, W.data(), hidden_size,
             R.data(), bx.data(), br.data());
 
-        std::vector<RescaleParam3> rescale_Wx(time_steps);
-        computeWxRescaleParamsFixedShift(
-            time_steps, gruQuantScales.x_scale, gruQuantScales.W.gate[0].scale,
-            gruQuantScales.W.gate[1].scale, gruQuantScales.W.gate[2].scale,
-            rescale_Wx);
+        computeGruRescaleParamsPerStep(time_steps, gruQuantScales, gruRescaleParams, 15);
 
         // Copy weights over to GPU.
         device_ptr<Tensor2f> W_tmp_dev(W);
@@ -209,6 +207,7 @@ void GruInferenceQuant(const Tensor2i8 &W,
                        const Tensor1i32 &br,
                        const Tensor3i8 &x,
                        const std::vector<RescaleParamsPerStep> &rescaleParams,
+                       const GruQuantScales &gruQuantScales,
                        Tensor3i8 &h // (time_steps + 1) * batch_size * hidden_size
 ) {
     const int time_steps = x.dimension(2);
@@ -237,6 +236,7 @@ void GruInferenceQuant(const Tensor2i8 &W,
             batch_size, input_size, hidden_size, g_blas_handle);
 
         forward.SetQuantParams(rescaleParams);
+        forward.SetGruQuantScales(gruQuantScales);
 
         forward.Run(time_steps, W_dev.data, R_dev.data, bx_dev.data, br_dev.data,
                     x_dev.data, h_dev.data, nullptr, tmp_Wx_dev.data, tmp_Rh_dev.data,
@@ -385,6 +385,7 @@ int main() {
     const int hidden_size = R.dimension(1);
 
     Tensor3f h_inference((time_steps + 1), batch_size, hidden_size);
+    h_inference.setRandom();
     GruInference(W, R, bx, br, x, h_inference);
 
     printf("cudaError(GruInference finish): %s\n", cudaGetErrorString(cudaGetLastError()));
@@ -400,6 +401,7 @@ int main() {
     Tensor1i32 br_quant(HIDDEN_DIMS * 3); // br: 3H(部分实现中偏置分输出\隐藏层. br 负责给“隐藏状态 h_{t-1} 到门控的线性变换” 加偏置
     Tensor3i8 x_quant(INPUT_DIMS, BATCH_SIZE, SEQUENCE_LEN);
     Tensor3i8 dh_new_quant(HIDDEN_DIMS, BATCH_SIZE, SEQUENCE_LEN + 1);
+
     GruQuantScales gruQuantScales;
     std::vector<RescaleParamsPerStep> rescaleParams(SEQUENCE_LEN);
     GruQuantInit<false>(W,
@@ -418,7 +420,22 @@ int main() {
                         rescaleParams);
 
     Tensor3i8 h_quant_inference((time_steps + 1), batch_size, hidden_size);
-    GruInferenceQuant(W_quant, R_quant, bx_quant, br_quant, x_quant,rescaleParams, h_quant_inference);
+    {
+        // N : batch_size
+        // C : input_size
+        QuantParams h_0_quantParams = calculateQuantParams<int8_t>(h_inference.data(),
+                                                                   batch_size * input_size);
+        gruQuantScales.h_scale[0] = h_0_quantParams.scale;
+
+        device_ptr<Tensor3f> h_dev(h_inference);
+        device_ptr<Tensor3i8> h_quant_dev((time_steps + 1) * batch_size * hidden_size);
+        quantizeFloatToInt<int8_t, true, true>(
+            h_dev.data, h_quant_dev.data, batch_size * hidden_size,
+            1.0f / gruQuantScales.h_scale[0]);
+        h_quant_dev.ToHost(h_quant_inference);
+    }
+
+    GruInferenceQuant(W_quant, R_quant, bx_quant, br_quant, x_quant, rescaleParams, gruQuantScales, h_quant_inference);
 
     printf("cudaError(GruInferenceQuant finish): %s\n", cudaGetErrorString(cudaGetLastError()));
 

@@ -4,12 +4,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <vector>
+#include <type_traits>
 
 #include "blas.h"
 #include "gru_quant.h"
 #include "inline_ops.h"
 #include "device_ptr.h"
 #include "quantize_ops.cuh"
+#include "quantize_ops_helper.hpp"
 
 namespace kernel {
 
@@ -328,8 +330,6 @@ void ForwardPassQuant<T>::IterateInternal(
                   batch_size, hidden_size, &alpha, R, hidden_size * 3, h,
                   hidden_size, &beta, tmp_Rh, hidden_size * 3);
 
-    // TODO: 计算 Rh_scale
-
     // Compute launch configuration for pointwise operations kernel.
     const dim3 blockDim(32, 16);
     const dim3 gridDim((hidden_size + blockDim.x - 1) / blockDim.x,
@@ -399,15 +399,22 @@ void ForwardPassQuant<T>::Run(const int steps, // 时间步数, 序列长度T
                   tmp_Wx, hidden_size * 3);
     cudaEventRecord(event, stream2);
 
+    // TODO: gemm后补偿x_zp
 
     const int NH = batch_size * hidden_size;
 
     for (int i = 0; i < steps; ++i) {
+        // 计算当前时间步的Rh_scale
+        computeRhScale(i, gruQuantScales_, rescaleParam_[i], 15);
 
         IterateInternal(i, R, bx, br, h + i * NH, h + (i + 1) * NH, v + i * NH * 4,
                         tmp_Wx + i * NH * 3, tmp_Rh, zoneout_prob,
                         zoneout_mask ? zoneout_mask + i * NH : nullptr);
-        // TODO: 计算当前时间步的h_scale
+
+        cudaDeviceSynchronize();
+        //
+        const T max_val = findMaxValueFromDev(h + (i + 1) * NH, NH);
+        gruQuantScales_.h_scale[i + 1] = 0.9 * gruQuantScales_.h_scale[i] + 0.1 * max_val;
     }
 
     cublasSetStream(blas_handle, save_stream);

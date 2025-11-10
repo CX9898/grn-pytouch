@@ -15,6 +15,8 @@ struct GruQuantScales {
   std::vector<float> x_scale;  // 每步一组 scale/zp，非对称
   std::vector<int32_t> x_zp;
 
+  std::vector<float> h_scale; // 动态计算
+
   QuantParams3 W; // 分为三个门: z, r, g
   QuantParams3 R; // 分为三个门: z, r, g
 
@@ -22,7 +24,7 @@ struct GruQuantScales {
   QuantParams3 br; // 分为三个门: z, r, g
 
   std::vector<QuantParams3> Wx;   // 每步一个 scale, 且分为三个门: z, r, g
-  std::vector<QuantParams3> Rh;   // 每步一个 scale, 且分为三个门: z, r, g
+//  std::vector<QuantParams3> Rh;   // 每步一个 scale, 且分为三个门: z, r, g
 
   // --- 激活输入 ---
   QuantParams z_pre;  // sigmoid(z_pre) pre-activation
@@ -119,20 +121,17 @@ GruQuantScales computeGruQuantParams(const float *x, int steps, int N, int C,
 
 
 /**
- * @brief 计算量化参数 scale 和 zero_point
- * @tparam QuantT     目标量化类型 (int8_t 或 int16_t)
- * @param host_data    输入数据指针 (float*)
- * @param size         输入数据元素数量
- * @param scale        输出缩放因子 (float)
- * @param zero_point   输出零点 (int32_t)
- * @param symmetric    是否使用对称量化
+ * @brief 计算量化参数（对称或非对称）
+ * @tparam QuantT   目标量化类型（如 int8_t 或 int16_t）
+ * @param data      输入浮点数据指针
+ * @param size      数据长度
+ * @param symmetric 是否使用对称量化（默认为 true）
+ * @return QuantParams 量化参数结构体
  */
 template<typename QuantT>
-void calculateScaleZeroPoint(
-    const float *host_data,
+QuantParams calculateQuantParams(
+    const float *data,
     size_t size,
-    float &scale,
-    int32_t &zero_point,
     bool symmetric = true);
 
 /**
@@ -208,3 +207,47 @@ void computeWxRescaleParamsFixedShift(
     const float w_scale_g,
     std::vector<RescaleParam3> &rescale_params
 );
+
+void computeRhScale(int t,
+                    GruQuantScales &gruQuantScales,
+                    RescaleParamsPerStep &params,
+                    int fixed_shift = 15);
+
+/**
+ * @brief 计算每个时间步的所有 RescaleParamsPerStep 参数
+ *
+ * @param steps           [in] 时间步数（序列长度）
+ * @param gruQuantScales  [in] GRU 量化参数
+ * @param h_scales        [in] 每个时间步隐藏状态 h 的量化 scale, size = steps + 1 (包含初始 h[0])
+ * @param rescale_params  [out] 每步输出的 RescaleParamsPerStep 数组, size = steps
+ * @param fixed_shift     [in] 固定的右移位数，默认 15
+ */
+void computeGruRescaleParamsPerStep(
+    int steps,
+    GruQuantScales &gruQuantScales,
+    std::vector<RescaleParamsPerStep> &rescale_params,
+    int fixed_shift = 15
+);
+
+/**
+ * @brief 从 GPU 上的量化数据计算 scale（使用最大最小值）
+ *
+ * @tparam QuantT         量化类型（int8_t 或 int16_t）
+ * @param h_dev           [in] GPU 上的量化数据指针
+ * @param size            [in] 数据元素数量
+ * @param scale           [out] 输出的 scale
+ * @param zero_point      [out] 输出的 zero_point
+ * @param symmetric       [in] 是否使用对称量化
+ * @param stream          [in] CUDA stream
+ */
+template<typename QuantT>
+void calculateScaleZeroPointFromDevice(
+    const QuantT *h_dev,
+    size_t size,
+    float &scale,
+    int32_t &zero_point,
+    bool symmetric = true,
+    cudaStream_t stream = 0);
+
+template<typename T>
+T findMaxValueFromDev(const T *dev_data, size_t size);

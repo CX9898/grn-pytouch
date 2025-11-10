@@ -1,5 +1,5 @@
 # Specify the minimum version of cmake
-cmake_minimum_required(VERSION 3.26)
+cmake_minimum_required(VERSION 3.10)
 
 # Project Information
 project(gru)

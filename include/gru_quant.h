@@ -30,7 +30,10 @@ class ForwardPassQuant {
 
   void SetQuantParams(const std::vector<RescaleParamsPerStep> &rescaleParam) {
       rescaleParam_ = rescaleParam;
-      quantize_enabled_ = true;
+  }
+
+  void SetGruQuantScales(const GruQuantScales &scales) {
+      gruQuantScales_ = scales;
   }
 
   // Performs one forward iteration of the GRU cell.
@@ -105,8 +108,8 @@ class ForwardPassQuant {
   struct private_data;
   private_data *data_;
 
-  bool quantize_enabled_ = false;
   std::vector<RescaleParamsPerStep> rescaleParam_;
+  GruQuantScales gruQuantScales_;  // 用于动态更新 rescale 参数
 };
 
 template<typename T>
