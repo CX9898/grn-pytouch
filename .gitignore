@@ -8,3 +8,11 @@
 /.idea/
 
 /*build*/
+
+/.vscode/
+
+/.github/
+
+/quantization_plots/
+
+/tools/
