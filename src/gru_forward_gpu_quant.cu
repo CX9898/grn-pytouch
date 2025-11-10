@@ -48,6 +48,12 @@ __device__ inline int32_t mul_and_rescale(int8_t a, int32_t b, int32_t M, int sh
     return (int32_t) ((static_cast<int64_t>(a) * b * M) >> shift);
 }
 
+// x : 非对称量化, scale分时间步不同
+// W : 对称量化, scale分为三个门
+// R : 对称量化, scale分为三个门
+// bx : 对称量化, scale分为三个门
+// br : 对称量化, scale分为三个门
+// h : 对称量化, scale分时间步不同
 template<typename T, bool Training, bool ApplyZoneout>
 __global__ void PointwiseOperationsQuant(
     const int batch_dim, // 批量大小
@@ -404,17 +410,17 @@ void ForwardPassQuant<T>::Run(const int steps, // 时间步数, 序列长度T
     const int NH = batch_size * hidden_size;
 
     for (int i = 0; i < steps; ++i) {
-        // 计算当前时间步的Rh_scale
-        computeRhScale(i, gruQuantScales_, rescaleParam_[i], 15);
+        // TODO: 计算当前时间步的Rh_scale
+//        computeRhScale(i, gruQuantScales_, rescaleParam_[i], 15);
 
         IterateInternal(i, R, bx, br, h + i * NH, h + (i + 1) * NH, v + i * NH * 4,
                         tmp_Wx + i * NH * 3, tmp_Rh, zoneout_prob,
                         zoneout_mask ? zoneout_mask + i * NH : nullptr);
 
         cudaDeviceSynchronize();
-        //
-        const T max_val = findMaxValueFromDev(h + (i + 1) * NH, NH);
-        gruQuantScales_.h_scale[i + 1] = 0.9 * gruQuantScales_.h_scale[i] + 0.1 * max_val;
+        // TODO: 计算下一步的h的scale(M, shift)
+//        const T max_val = findMaxValueFromDev(h + (i + 1) * NH, NH);
+//        gruQuantScales_.h_scale[i + 1] = 0.9 * gruQuantScales_.h_scale[i] + 0.1 * max_val;
     }
 
     cublasSetStream(blas_handle, save_stream);

@@ -37,16 +37,162 @@ struct GruQuantScales {
   QuantParams g;  // 输出门 g
 };
 
+
 // Rescale 参数结构体
-struct RescaleParam {
+struct ScaleParam {
   int32_t M;  // M, 整数乘法系数，对齐到目标 scale 使用
   int shift;         // shift, 右移位数，用于 CUDA kernel
 };
 
-struct RescaleParam3 { // 对应三个门: z, r, g
+struct ScaleParam3 { // 对应三个门: z, r, g
   int32_t M[3];         // M, 整数乘法系数，对齐到目标 scale 使用
   int shift[3];         // shift, 右移位数，用于 CUDA kernel
 };
+
+/**
+ * @brief 组合两个 scale 参数，计算结果的定点比例系数
+ * @param a    第一个 scale 参数（例如 W 或 R）
+ * @param b    第二个 scale 参数（例如 x 或 h）
+ * @return     组合后的 scale 参数（对应 a*b）
+ */
+inline ScaleParam combineSingleScale(const ScaleParam &a, const ScaleParam &b) {
+    int64_t M_tmp = static_cast<int64_t>(a.M) * static_cast<int64_t>(b.M);
+    int shift_tmp = a.shift + b.shift;
+
+    // 归一化，防止溢出 32 位
+    int norm_shift = 0;
+    while (std::abs(M_tmp) > (1LL << 31)) {
+        M_tmp >>= 1;
+        norm_shift--;
+    }
+
+    ScaleParam result;
+    result.M = static_cast<int32_t>(M_tmp);
+    result.shift = shift_tmp + norm_shift;
+    return result;
+}
+
+// --- ScaleParam3 × ScaleParam ---
+inline ScaleParam3 combineScaleParam3(const ScaleParam3 &a, const ScaleParam &b) {
+    ScaleParam3 result;
+    for (int g = 0; g < 3; ++g) {
+        ScaleParam single_a{a.M[g], a.shift[g]};
+        ScaleParam combined = combineSingleScale(single_a, b);
+        result.M[g] = combined.M;
+        result.shift[g] = combined.shift;
+    }
+    return result;
+}
+
+
+struct GruQuantScalesFixed {
+  // 输入 x（非对称量化，每步可能不同）
+  std::vector<ScaleParam> x; // size = 时间步
+  std::vector<int32_t> x_zp; // size = 时间步
+
+  // 隐藏状态 h（对称量化，每步可能不同）
+  std::vector<ScaleParam> h; // size = 时间步+1, 动态更新
+
+  // 权重和偏置，三个门
+  ScaleParam3 W;
+  ScaleParam3 R;
+  ScaleParam3 bx;
+  ScaleParam3 br;
+
+  // Wx 和 Rh 对齐参数
+  std::vector<ScaleParam3> Wx; // size = 时间步
+  std::vector<ScaleParam3> Rh; // size = 时间步+1, 动态更新
+
+  // 激活前后
+  ScaleParam z_pre, r_pre, g_pre;
+  ScaleParam z, r, g;
+
+  // ------------------------
+  // 初始化函数：输入浮点 scale/zp
+  // ------------------------
+  void initialize(
+      const GruQuantScales &gruQuantScales
+  ) {
+      const int seq_len = gruQuantScales.x_scale.size();
+      x.resize(seq_len);
+      x_zp.resize(seq_len);
+      h.resize(gruQuantScales.h_scale.size());
+      Wx.resize(seq_len);
+      Rh.resize(seq_len + 1);
+
+      // 权重和偏置
+      W = float3ToFixed3(gruQuantScales.W);
+      R = float3ToFixed3(gruQuantScales.R);
+      bx = float3ToFixed3(gruQuantScales.bx);
+      br = float3ToFixed3(gruQuantScales.br);
+
+      // x/h 每步 scale -> M/shift
+      for (int t = 0; t < seq_len; ++t) {
+          x[t] = floatScaleToFixed(gruQuantScales.x_scale[t]);
+          x_zp[t] = gruQuantScales.x_zp[t];
+
+          ScaleParam3 wx_p;
+          for (int g = 0; g < 3; ++g) {
+              ScaleParam w_gate{W.M[g], W.shift[g]};
+              auto combined = combineSingleScale(w_gate, x[t]);
+              wx_p.M[g] = combined.M;
+              wx_p.shift[g] = combined.shift;
+          }
+          Wx[t] = wx_p;
+      }
+
+      // 时间步0的h_scale, 后续动态更新
+      h[0] = floatScaleToFixed(gruQuantScales.h_scale[0]);
+      {
+          ScaleParam3 Rh_p;
+          for (int g = 0; g < 3; ++g) {
+              ScaleParam R_gate{R.M[g], R.shift[g]};
+              auto combined = combineSingleScale(R_gate, x[0]);
+              Rh_p.M[g] = combined.M;
+              Rh_p.shift[g] = combined.shift;
+          }
+          Rh[0] = Rh_p;
+      }
+
+      // 激活前后默认用 M=1, shift=0
+//      z_pre = {1, 0, 0};
+//      r_pre = {1, 0, 0};
+//      g_pre = {1, 0, 0};
+//      z = {1, 0, 0};
+//      r = {1, 0, 0};
+//      g = {1, 0, 0};
+  }
+
+ private:
+  // float scale -> M/shift
+  ScaleParam floatScaleToFixed(float scale) {
+      // 假设使用 Q31 风格定点:
+      // scale = M / (2^shift)
+      // shift = ceil(log2(M/scale))
+      int shift = 0;
+      int32_t M = 0;
+
+      if (scale > 0.f) {
+          double q = std::frexp(scale, &shift); // scale = q * 2^shift, 0.5<=q<1
+          M = static_cast<int32_t>(q * (1ll << 31)); // Q31
+      } else {
+          M = 0;
+          shift = 0;
+      }
+      return {M, shift};
+  }
+
+  ScaleParam3 float3ToFixed3(const QuantParams3 &fp) {
+      ScaleParam3 out;
+      for (int i = 0; i < 3; i++) {
+          ScaleParam scale = floatScaleToFixed(fp.gate[i].scale);
+          out.M[i] = scale.M;
+          out.shift[i] = scale.shift;
+      }
+      return out;
+  }
+};
+
 
 /**
  * @brief 每个时间步（step）对应的量化重标定参数集合，用于 GRU 三个门（z、r、g）的定点缩放对齐。
@@ -67,7 +213,7 @@ struct RescaleParamsPerStep {
    * 对应公式：
    *   Rh_aligned = (Rh * M[i]) >> shift[i]
    */
-  RescaleParam3 Rh_to_Wx;
+  ScaleParam3 Rh_to_Wx;
 
   /**
    * @brief bx → Wx 对齐的 rescale 参数
@@ -75,7 +221,7 @@ struct RescaleParamsPerStep {
    * 将输入偏置 bx 对齐到 Wx 的 scale。
    * 每个门（z、r、g）分别对应一个缩放因子。
    */
-  RescaleParam3 bx_to_Wx;
+  ScaleParam3 bx_to_Wx;
 
   /**
    * @brief br → Wx 对齐的 rescale 参数
@@ -83,7 +229,7 @@ struct RescaleParamsPerStep {
    * 将隐藏偏置 br 对齐到 Wx 的 scale。
    * 每个门（z、r、g）分别对应一个缩放因子。
    */
-  RescaleParam3 br_to_Wx;
+  ScaleParam3 br_to_Wx;
 
   /**
    * @brief Wx → 输出门(z/r/g) 对齐的 rescale 参数
@@ -91,7 +237,7 @@ struct RescaleParamsPerStep {
    * 将累加结果 (Wx + Rh + bx + br) 对齐到门激活函数（sigmoid / tanh）输入的 scale。
    * 通常用于将中间 int32 累加结果量化回 int8。
    */
-  RescaleParam3 Wx_to_out;
+  ScaleParam3 Wx_to_out;
 
   /**
    * @brief r → Wx_g 对齐的 rescale 参数
@@ -100,7 +246,7 @@ struct RescaleParamsPerStep {
    * 此时需要将门 r 的输出 scale 对齐到 Wx_g 的 scale。
    * 只对 g 门有效，z、r 门的该值可忽略。
    */
-  RescaleParam r_to_Wx_g;
+  ScaleParam r_to_Wx_g;
 };
 
 
@@ -108,9 +254,9 @@ struct RescaleParamsPerStep {
  * @param src_scale     源张量的量化 scale (float)
  * @param dst_scale     目标张量的量化 scale (float)
  * @param fixed_shift   固定的右移位数，用于 kernel 右移，默认 15
- * @return RescaleParam 包含整数 multiplier 和 kernel 右移 shift
+ * @return ScaleParam 包含整数 multiplier 和 kernel 右移 shift
  */
-inline RescaleParam computeRescaleParamFixedShift(float src_scale, float dst_scale, int fixed_shift = 15);
+inline ScaleParam computeRescaleParamFixedShift(float src_scale, float dst_scale, int fixed_shift = 15);
 
 
 template<typename QuantT>
@@ -190,14 +336,14 @@ void applyZeroPointCompensation2D(
     cudaStream_t stream = 0);
 
 /**
- * @brief 计算每个时间步的 RescaleParam3 参数（用于 Wx）
+ * @brief 计算每个时间步的 ScaleParam3 参数（用于 Wx）
  *
  * @param steps           [in] 时间步数（序列长度）
  * @param x_scales        [in] 每个时间步输入 x 的量化 scale, size = steps
  * @param w_scale_z       [in] Wz 的对称量化 scale
  * @param w_scale_r       [in] Wr 的对称量化 scale
  * @param w_scale_g       [in] Wg 的对称量化 scale
- * @param rescale_params  [out] 每步输出的 RescaleParam3 数组, size = steps, 对应三个门 z,r,g
+ * @param rescale_params  [out] 每步输出的 ScaleParam3 数组, size = steps, 对应三个门 z,r,g
  */
 void computeWxRescaleParamsFixedShift(
     int steps,
@@ -205,13 +351,8 @@ void computeWxRescaleParamsFixedShift(
     const float w_scale_z,
     const float w_scale_r,
     const float w_scale_g,
-    std::vector<RescaleParam3> &rescale_params
+    std::vector<ScaleParam3> &rescale_params
 );
-
-void computeRhScale(int t,
-                    GruQuantScales &gruQuantScales,
-                    RescaleParamsPerStep &params,
-                    int fixed_shift = 15);
 
 /**
  * @brief 计算每个时间步的所有 RescaleParamsPerStep 参数
@@ -249,5 +390,81 @@ void calculateScaleZeroPointFromDevice(
     bool symmetric = true,
     cudaStream_t stream = 0);
 
+/**
+ * @brief 计算一个张量的定点缩放参数对齐到另一个张量的 scale
+ * @param M_src       源张量的 M
+ * @param shift_src   源张量的 shift
+ * @param M_dst       目标张量的 M
+ * @param shift_dst   目标张量的 shift
+ * @param N           固定精度（通常取31）
+ * @return            对齐参数 (M_align, shift_align)
+ */
+inline ScaleParam computeRescaleTo(
+    const ScaleParam src,
+    const ScaleParam dst,
+    int N = 31) {
+    ScaleParam p;
+    // 计算新的 M （放大到 QN 精度后再除）
+    int64_t tmp = ((int64_t(1) << N) * src.M + (dst.M / 2)) / dst.M; // 四舍五入
+    p.M = static_cast<int32_t>(tmp);
+    p.shift = N + src.shift - dst.shift;
+    return p;
+}
+
 template<typename T>
 T findMaxValueFromDev(const T *dev_data, size_t size);
+
+/**
+ * @brief 使用 (M, shift) 参数将量化值反量化为浮点数
+ * @tparam QuantT      量化类型（int8_t / int16_t / int32_t）
+ * @param quant_data   输入量化数据指针
+ * @param size         数据元素数量
+ * @param M            定点缩放系数（整数）
+ * @param shift        缩放右移位数
+ * @param dequant_data 输出反量化后的 float 数组
+ */
+template<typename QuantT>
+void dequantizeTensorFixedPoint(const QuantT *quant_data,
+                                size_t size,
+                                int32_t M,
+                                int shift,
+                                float *dequant_data) {
+    // 计算等效的scale（float），只在CPU上调试时使用
+    const float scale = static_cast<float>(M) / static_cast<float>(1 << shift);
+
+    for (size_t i = 0; i < size; ++i) {
+        const int32_t q = static_cast<int32_t>(quant_data[i]);
+        dequant_data[i] = q * scale;
+    }
+}
+
+// 定义常量
+constexpr int32_t Q15_ONE = 32768;
+constexpr int32_t ALPHA_Q15 = 29491; // 0.9 * 32768
+constexpr int32_t INV_QMAX = (1 << 15) / 127; // 257 in Q15
+
+// 输入: 上一步scale参数 (M_prev, shift_prev)
+// 输入: 当前步隐藏态整数张量 h_t_int[]
+// 输出: 更新后的scale参数 (M_new, shift_new)
+inline void updateHScaleInt8(const int8_t *h_t, size_t size,
+                      int32_t &M_prev, int &shift_prev) {
+    // 1. 求当前步最大值
+    int max_abs = 0;
+    for (size_t i = 0; i < size; ++i)
+        max_abs = std::max(max_abs, abs((int) h_t[i]));
+
+    // 2. ratio 定点化 (Q15)
+    int32_t ratio_q15 = (max_abs * INV_QMAX); // Q15 格式
+
+    // 3. EMA 更新 (Q15)
+    static int32_t s_prev_q15 = Q15_ONE; // 初始scale比例=1.0
+    int32_t s_new_q15 = (ALPHA_Q15 * s_prev_q15 +
+                         (Q15_ONE - ALPHA_Q15) * ratio_q15 + (1 << 14)) >> 15;
+    s_prev_q15 = s_new_q15;
+
+    // 4. 更新 M (scale整数因子)
+    M_prev = (M_prev * s_new_q15 + (1 << 14)) >> 15;
+
+    // shift_prev 可视范围动态调整（或保持不变）
+}
+

@@ -252,8 +252,8 @@ void applyZeroPointCompensation2D(
     );
 }
 
-inline RescaleParam computeRescaleParamFixedShift(float src_scale, float dst_scale, int fixed_shift) {
-    RescaleParam param;
+inline ScaleParam computeRescaleParamFixedShift(float src_scale, float dst_scale, int fixed_shift) {
+    ScaleParam param;
 
     if (src_scale <= 0.0f || dst_scale <= 0.0f) {
         // 避免非法 scale
@@ -411,14 +411,14 @@ template GruQuantScales computeGruQuantParams<int32_t>(const float *x, int steps
 
 
 /**
- * @brief 计算每个时间步的 RescaleParam3 参数（用于 Wx）
+ * @brief 计算每个时间步的 ScaleParam3 参数（用于 Wx）
  *
  * @param steps           [in] 时间步数（序列长度）
  * @param x_scales        [in] 每个时间步输入 x 的量化 scale, size = steps
  * @param w_scale_z       [in] Wz 的对称量化 scale
  * @param w_scale_r       [in] Wr 的对称量化 scale
  * @param w_scale_g       [in] Wg 的对称量化 scale
- * @param rescale_params  [out] 每步输出的 RescaleParam3 数组, size = steps
+ * @param rescale_params  [out] 每步输出的 ScaleParam3 数组, size = steps
  */
 void computeWxRescaleParamsFixedShift(
     int steps,
@@ -426,7 +426,7 @@ void computeWxRescaleParamsFixedShift(
     const float w_scale_z,
     const float w_scale_r,
     const float w_scale_g,
-    std::vector<RescaleParam3> &rescale_params
+    std::vector<ScaleParam3> &rescale_params
 ) {
     rescale_params.resize(steps);
     constexpr int MAX_SHIFT = 31;
@@ -439,7 +439,7 @@ void computeWxRescaleParamsFixedShift(
 
         const float scales[3] = {scale_z, scale_r, scale_g};
 
-        RescaleParam3 p{};
+        ScaleParam3 p{};
         for (int gate = 0; gate < 3; ++gate) {
             float scale_val = scales[gate];
 
@@ -459,30 +459,6 @@ void computeWxRescaleParamsFixedShift(
 
         rescale_params[t] = p;
     }
-}
-
-void computeRhScale(int t,
-                    GruQuantScales &gruQuantScales,
-                    RescaleParamsPerStep &params,
-                    int fixed_shift) {
-    // 计算 Rh 的 scale（每步每个门）：Rh = R * h, scale_Rh = scale_R * scale_h
-    const float rh_scale_z = gruQuantScales.R.gate[0].scale * gruQuantScales.h_scale[t];
-    const float rh_scale_r = gruQuantScales.R.gate[1].scale * gruQuantScales.h_scale[t];
-    const float rh_scale_g = gruQuantScales.R.gate[2].scale * gruQuantScales.h_scale[t];
-
-    // 计算 Rh_to_Wx 的 rescale 参数（每个门）
-    params.Rh_to_Wx.M[0] = computeRescaleParamFixedShift(rh_scale_z,
-                                                         gruQuantScales.Wx[t].gate[0].scale,
-                                                         fixed_shift).M;
-    params.Rh_to_Wx.shift[0] = fixed_shift;
-    params.Rh_to_Wx.M[1] = computeRescaleParamFixedShift(rh_scale_r,
-                                                         gruQuantScales.Wx[t].gate[1].scale,
-                                                         fixed_shift).M;
-    params.Rh_to_Wx.shift[1] = fixed_shift;
-    params.Rh_to_Wx.M[2] = computeRescaleParamFixedShift(rh_scale_g,
-                                                         gruQuantScales.Wx[t].gate[2].scale,
-                                                         fixed_shift).M;
-    params.Rh_to_Wx.shift[2] = fixed_shift;
 }
 
 /**

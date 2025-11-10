@@ -298,15 +298,17 @@ __device__ __forceinline__ int8_t tanh_int16_lut(int16_t x, const int8_t* lut) {
    > - 首先要计算 W_sum, 也就是 W 每行的和 // 是否可以初始化的时候做, 或者外部传入
    > - 然后遍历 Wx的所有元素, 每一行的值都要减去当前行的 x_zp * W_sum[当前行]
 
-4. for i in 0..steps-1: 循环每个时间步
-    1. 调用 cuBlas::GEMM 算好 R * h.
-    2. 执行逐元素并行运算(CUDA Kernel)
+4. for i in 0~steps: 循环每个时间步
+    1. 计算当前时间步的Rh_scale(M,shift) 和 Rh_to_Wx(M,shift)
+    2. 调用 cuBlas::GEMM 算好 R * h.
+    3. 执行逐元素并行运算(CUDA Kernel)
         1. Rh_aligned_z = rescale(Rh_z); bx_aligned_z = rescale(bx_z); br_aligned_z = rescale(br_z);
         2. const int32_t z_tmp_i32 = Wx[z_idx] + Rh_aligned_z + bx_aligned_z + br_aligned_z;
         3. const int8_t z_tmp_i8 = dev::quantize_i32_to_i8(z_tmp_i32, rescale_Wx_z_to_z.M, rescale_Wx_z_to_z.shift);
         4. z = dev::sigmoid_int8_lut(z_tmp_i8); // 更新门z
 
         5.
-    3. 计算当前时间步的h的scale.
+    4. 计算新计算出来的h的scale(M,shift)
+   
    > - h 是对称量化?
    > - 是不是只需要计算h的scale

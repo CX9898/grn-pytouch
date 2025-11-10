@@ -6,6 +6,7 @@
 #include <iostream>
 #include <string>
 #include <unsupported/Eigen/CXX11/Tensor>
+#include <vector>
 
 #include "devVector.cuh"
 #include "device_ptr.h"
@@ -207,7 +208,7 @@ void GruInferenceQuant(const Tensor2i8 &W,
                        const Tensor1i32 &br,
                        const Tensor3i8 &x,
                        const std::vector<RescaleParamsPerStep> &rescaleParams,
-                       const GruQuantScales &gruQuantScales,
+                       const GruQuantScalesFixed &gruQuantScalesFixed,
                        Tensor3i8 &h // (time_steps + 1) * batch_size * hidden_size
 ) {
     const int time_steps = x.dimension(2);
@@ -226,7 +227,7 @@ void GruInferenceQuant(const Tensor2i8 &W,
     device_ptr<Tensor2i32> tmp_Rh_dev(batch_size * hidden_size * 3); // 用于存放R * h的中间结果
 
     device_ptr<Tensor3i8> h_dev(h);
-    h_dev.zero(); // h初始化为0
+//    h_dev.zero(); // h初始化为0
 
     {
         ScopeTimer t("Inference Quant:");
@@ -236,7 +237,7 @@ void GruInferenceQuant(const Tensor2i8 &W,
             batch_size, input_size, hidden_size, g_blas_handle);
 
         forward.SetQuantParams(rescaleParams);
-        forward.SetGruQuantScales(gruQuantScales);
+        forward.SetGruQuantScales(gruQuantScalesFixed);
 
         forward.Run(time_steps, W_dev.data, R_dev.data, bx_dev.data, br_dev.data,
                     x_dev.data, h_dev.data, nullptr, tmp_Wx_dev.data, tmp_Rh_dev.data,
@@ -264,21 +265,23 @@ void GruInference(const Tensor2f &W,
     device_ptr<Tensor1f> br_dev(br);
     device_ptr<Tensor3f> x_dev(x);
 
-    device_ptr<Tensor3f> h_dev((time_steps + 1) * batch_size * hidden_size);
+    device_ptr<Tensor3f> h_dev(h);
     device_ptr<Tensor3f> tmp_Wx_dev(time_steps * batch_size * hidden_size * 3); // 用于存放W * x的中间结果
     device_ptr<Tensor2f> tmp_Rh_dev(batch_size * hidden_size * 3); // 用于存放R * h的中间结果
 
-    h_dev.zero(); // h初始化为0
+//    h_dev.zero(); // h初始化为0
 
-    ScopeTimer t("Inference:");
+    {
+        ScopeTimer t("Inference:");
 
-    gru::ForwardPass<float> forward = gru::ForwardPass<float>(
-        false, // training
-        batch_size, input_size, hidden_size, g_blas_handle);
+        gru::ForwardPass<float> forward = gru::ForwardPass<float>(
+            false, // training
+            batch_size, input_size, hidden_size, g_blas_handle);
 
-    forward.Run(time_steps, W_dev.data, R_dev.data, bx_dev.data, br_dev.data,
-                x_dev.data, h_dev.data, nullptr, tmp_Wx_dev.data, tmp_Rh_dev.data,
-                0.0f, nullptr);
+        forward.Run(time_steps, W_dev.data, R_dev.data, bx_dev.data, br_dev.data,
+                    x_dev.data, h_dev.data, nullptr, tmp_Wx_dev.data, tmp_Rh_dev.data,
+                    0.0f, nullptr);
+    }
 
     h_dev.ToHost(h);
 }
@@ -355,6 +358,79 @@ void GruTrain(const Tensor2f &W, // 输入到隐藏层的权重矩阵. [input_si
     }
 }
 
+// 计算余弦相似度
+float cosineSimilarity(const std::vector<float> &a, const std::vector<float> &b) {
+    float dot = 0.0f, norm_a = 0.0f, norm_b = 0.0f;
+    for (size_t i = 0; i < a.size(); ++i) {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+    return dot / (std::sqrt(norm_a) * std::sqrt(norm_b) + 1e-8f); // 防止除零
+}
+
+void checkHQuantizationWithCosine(
+    const std::vector<float> &h_inference,          // 浮点 h, size = (time_steps+1) * batch_size * hidden_size
+    const std::vector<int8_t> &h_quant_inference,  // 量化 h, size 同上
+    int time_steps,
+    int batch_size,
+    int hidden_size,
+    const std::vector<ScaleParam> &scaleParam,                  // 每步 scale M, 每步 shift
+    float threshold = 1.0f                          // 超阈值
+) {
+
+    float max_h = 0.0f;
+    for (float v : h_inference) max_h = std::max(max_h, std::abs(v));
+    float step = max_h / 127.0f;  // int8
+    threshold = 0.5f * step;
+
+    const int size_per_step = batch_size * hidden_size;
+
+    std::vector<float> h_float_step(size_per_step);
+    std::vector<float> h_quant_step(size_per_step);
+
+    for (int t = 1; t <= time_steps; ++t) {
+        // 拷贝浮点 h
+        std::copy(h_inference.begin() + t * size_per_step,
+                  h_inference.begin() + (t + 1) * size_per_step,
+                  h_float_step.begin());
+
+        // 反量化
+        dequantizeTensorFixedPoint(h_quant_inference.data() + t * size_per_step,
+                                   size_per_step,
+                                   scaleParam[t].M,
+                                   scaleParam[t].shift,
+                                   h_quant_step.data());
+
+        // 差值统计
+        float max_diff = 0.0f;
+        float sum_diff = 0.0f;
+
+
+        int count = 0;
+        for (int idx = 0; idx < size_per_step; ++idx) {
+            float diff = std::abs(h_float_step[idx] - h_quant_step[idx]);
+            sum_diff += diff;
+            if (diff > max_diff) max_diff = diff;
+
+            if (diff > threshold) {
+                count++;
+                if (count < 5) {
+                    printf("[Warning] t=%d idx=%d diff=%f h_float=%f h_quant=%f\n",
+                           t, idx, diff, h_float_step[idx], h_quant_step[idx]);
+                }
+            }
+        }
+        const float baifenbi = static_cast<float>(count) / static_cast<float>(size_per_step);
+
+        float mean_diff = sum_diff / size_per_step;
+        float cos_sim = cosineSimilarity(h_float_step, h_quant_step);
+
+        printf("Time step %d: max_diff=%f, mean_diff=%f, cosine_sim=%f, baifenbi = %f\n",
+               t, max_diff, mean_diff, cos_sim, baifenbi);
+    }
+}
+
 int main() {
     srand(time(0));
 
@@ -424,7 +500,7 @@ int main() {
         // N : batch_size
         // C : input_size
         QuantParams h_0_quantParams = calculateQuantParams<int8_t>(h_inference.data(),
-                                                                   batch_size * input_size);
+                                                                   batch_size * hidden_size);
         gruQuantScales.h_scale[0] = h_0_quantParams.scale;
 
         device_ptr<Tensor3f> h_dev(h_inference);
@@ -435,7 +511,29 @@ int main() {
         h_quant_dev.ToHost(h_quant_inference);
     }
 
-    GruInferenceQuant(W_quant, R_quant, bx_quant, br_quant, x_quant, rescaleParams, gruQuantScales, h_quant_inference);
+    GruQuantScalesFixed gruQuantScalesFixed;
+    gruQuantScalesFixed.initialize(gruQuantScales);
+
+    GruInferenceQuant(W_quant,
+                      R_quant,
+                      bx_quant,
+                      br_quant,
+                      x_quant,
+                      rescaleParams,
+                      gruQuantScalesFixed,
+                      h_quant_inference);
+
+    { // Test
+        std::vector<float> h_inference_tmp(h_inference.data(), h_inference.data() + h_inference.size());
+        std::vector<int8_t> h_quant_inference_tmp(h_quant_inference.data(),
+                                                  h_quant_inference.data() + h_quant_inference.size());
+        checkHQuantizationWithCosine(h_inference_tmp,
+                                     h_quant_inference_tmp,
+                                     time_steps,
+                                     batch_size,
+                                     hidden_size,
+                                     gruQuantScalesFixed.h);
+    }
 
     printf("cudaError(GruInferenceQuant finish): %s\n", cudaGetErrorString(cudaGetLastError()));
 

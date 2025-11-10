@@ -32,8 +32,8 @@ class ForwardPassQuant {
       rescaleParam_ = rescaleParam;
   }
 
-  void SetGruQuantScales(const GruQuantScales &scales) {
-      gruQuantScales_ = scales;
+  void SetGruQuantScales(const GruQuantScalesFixed &gruQuantScalesFixed) {
+      gruQuantScales_ = gruQuantScalesFixed;
   }
 
   // Performs one forward iteration of the GRU cell.
@@ -109,7 +109,7 @@ class ForwardPassQuant {
   private_data *data_;
 
   std::vector<RescaleParamsPerStep> rescaleParam_;
-  GruQuantScales gruQuantScales_;  // 用于动态更新 rescale 参数
+  GruQuantScalesFixed gruQuantScales_;  // 用于动态更新 rescale 参数
 };
 
 template<typename T>
