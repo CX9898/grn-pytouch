@@ -55,6 +55,9 @@ __device__ inline int32_t mul_and_rescale(int8_t a, int32_t b, int32_t M, int sh
 // bx : 对称量化, scale分为三个门
 // br : 对称量化, scale分为三个门
 // h : 对称量化, scale分时间步不同
+//
+// C = input_size(输入维度), H = hidden_size(隐藏层维度),
+// T = time_steps(时间步), N = batch_size(批量大小)
 template<typename T, bool Training, bool ApplyZoneout>
 __global__ void PointwiseOperationsQuant(
     const int batch_dim, // 批量大小
@@ -367,10 +370,12 @@ void ForwardPassQuant<T>::IterateInternal(
     }
 }
 
+// C = input_size(输入维度), H = hidden_size(隐藏层维度),
+// T = time_steps(时间步), N = batch_size(批量大小)
 template<typename T>
 void ForwardPassQuant<T>::Run(const int steps, // 时间步数, 序列长度T
-                              const T *W,   // [C,H*3], 输入到隐藏状态的权重矩阵（Wx）, 对应 GRU 的三个门（z、r、h）。C 是输入特征维度，H 是隐藏状态维度
-                              const T *R,   // [H,H*3], 隐状态到隐藏状态的权重矩阵（Rh），对应 GRU 的三个门（z、r、h）
+                              const T *W,   // [C,H*3], 输入到隐藏状态的权重矩阵（Wx）, 对应 GRU 的三个门（z、r、h）。C 是输入特征维度，H 是隐藏状态维度, （行主序，计算 x @ W）
+                              const T *R,   // [H,H*3], 隐状态到隐藏状态的权重矩阵（Rh），对应 GRU 的三个门（z、r、h）. （行主序，计算 h @ R）
                               const int32_t *bx,  // [H*3], 输入偏置（bias for W），对应 z、r、h 门
                               const int32_t *br,  // [H*3], 隐状态偏置（bias for R），对应 z、r、h 门
                               const T *x,   // [N,C], 输入序列，batch_size = N，特征维度 = C
@@ -402,24 +407,30 @@ void ForwardPassQuant<T>::Run(const int steps, // 时间步数, 序列长度T
                   CUBLAS_OP_N, CUBLAS_OP_N, hidden_size * 3, steps * batch_size,
                   input_size, &alpha, W, hidden_size * 3, x, input_size, &beta,
                   tmp_Wx, hidden_size * 3);
-    cudaEventRecord(event, stream2);
 
-    // TODO: gemm后补偿x_zp
+    // gemm后补偿x_zp
+    dev::vector<int32_t> w_sum(1);
+    computeWeightSum(W, w_sum.data(), hidden_size * 3, input_size, stream2);
+    dev::vector<int32_t> x_zp(gruQuantScales_.x_zp);
+    applyZeroPointCompensation2D(tmp_Wx, w_sum.data(), x_zp.data(), hidden_size * 3, steps * batch_size, stream2);
+
+    // 同步Wx计算
+    cudaEventRecord(event, stream2);
 
     const int NH = batch_size * hidden_size;
 
     for (int i = 0; i < steps; ++i) {
-        // TODO: 计算当前时间步的Rh_scale
-//        computeRhScale(i, gruQuantScales_, rescaleParam_[i], 15);
+        // 计算当前时间步的Rh_scale
+        gruQuantScales_.Rh[i] = combineRWithH(gruQuantScales_.R, gruQuantScales_.h[i]);
 
         IterateInternal(i, R, bx, br, h + i * NH, h + (i + 1) * NH, v + i * NH * 4,
                         tmp_Wx + i * NH * 3, tmp_Rh, zoneout_prob,
                         zoneout_mask ? zoneout_mask + i * NH : nullptr);
 
         cudaDeviceSynchronize();
-        // TODO: 计算下一步的h的scale(M, shift)
-//        const T max_val = findMaxValueFromDev(h + (i + 1) * NH, NH);
-//        gruQuantScales_.h_scale[i + 1] = 0.9 * gruQuantScales_.h_scale[i] + 0.1 * max_val;
+        // 计算下一步的h的scale(M, shift)
+        const T max_val = findMaxValueFromDev(h + (i + 1) * NH, NH);
+        gruQuantScales_.h[i + 1] = updateHScale(gruQuantScales_.h[i], max_val);
     }
 
     cublasSetStream(blas_handle, save_stream);

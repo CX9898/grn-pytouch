@@ -85,6 +85,61 @@ inline ScaleParam3 combineScaleParam3(const ScaleParam3 &a, const ScaleParam &b)
 }
 
 
+template<typename T>
+inline ScaleParam updateHScale(const ScaleParam &h_old, T max_val) {
+    ScaleParam h_new;
+    // scale 放大因子，例如 1e6 对应 20 位
+    constexpr int32_t SCALE_FACTOR = 1 << 20;
+
+    int32_t M_prev = h_old.M;   // 放大整数表示
+    int32_t M_max = int32_t(max_val * SCALE_FACTOR); // float -> int
+
+    // 更新 M，整数加权 (0.9/0.1)
+    int32_t new_M = (9 * M_prev + 1 * M_max) / 10;
+
+    // shift 一般保持不变或者可根据 new_M 调整
+    int new_shift = h_old.shift;
+    h_new.M = new_M;
+    h_new.shift = new_shift;
+}
+
+/**
+ * @brief 计算 Rh = R * h 的 ScaleParam3
+ * @param R       输入 R 的量化参数 (三个门)
+ * @param h       输入 h 的量化参数 (单个 M/shift)
+ * @param SCALE_BITS 放大整数位数（如果 M 是放大整数）
+ * @return        Rh 的量化参数 (三个门)
+ */
+inline ScaleParam3 combineRWithH(const ScaleParam3 &R, const ScaleParam &h, int SCALE_BITS = 20) {
+    ScaleParam3 Rh;
+    for (int i = 0; i < 3; ++i) {
+        // M = (M_R * M_h) >> SCALE_BITS
+        Rh.M[i] = int32_t((int64_t) R.M[i] * h.M >> SCALE_BITS);
+        // shift = shift_R + shift_h
+        Rh.shift[i] = R.shift[i] + h.shift;
+    }
+    return Rh;
+}
+
+// float scale -> M/shift
+inline ScaleParam floatScaleToFixed(float scale) {
+    // 假设使用 Q31 风格定点:
+    // scale = M / (2^shift)
+    // shift = ceil(log2(M/scale))
+    int shift = 0;
+    int32_t M = 0;
+
+    if (scale > 0.f) {
+        double q = std::frexp(scale, &shift); // scale = q * 2^shift, 0.5<=q<1
+        M = static_cast<int32_t>(q * (1ll << 31)); // Q31
+    } else {
+        M = 0;
+        shift = 0;
+    }
+    return {M, shift};
+}
+
+
 struct GruQuantScalesFixed {
   // 输入 x（非对称量化，每步可能不同）
   std::vector<ScaleParam> x; // size = 时间步
@@ -147,7 +202,7 @@ struct GruQuantScalesFixed {
           ScaleParam3 Rh_p;
           for (int g = 0; g < 3; ++g) {
               ScaleParam R_gate{R.M[g], R.shift[g]};
-              auto combined = combineSingleScale(R_gate, x[0]);
+              auto combined = combineSingleScale(R_gate, h[0]);
               Rh_p.M[g] = combined.M;
               Rh_p.shift[g] = combined.shift;
           }
@@ -164,23 +219,7 @@ struct GruQuantScalesFixed {
   }
 
  private:
-  // float scale -> M/shift
-  ScaleParam floatScaleToFixed(float scale) {
-      // 假设使用 Q31 风格定点:
-      // scale = M / (2^shift)
-      // shift = ceil(log2(M/scale))
-      int shift = 0;
-      int32_t M = 0;
 
-      if (scale > 0.f) {
-          double q = std::frexp(scale, &shift); // scale = q * 2^shift, 0.5<=q<1
-          M = static_cast<int32_t>(q * (1ll << 31)); // Q31
-      } else {
-          M = 0;
-          shift = 0;
-      }
-      return {M, shift};
-  }
 
   ScaleParam3 float3ToFixed3(const QuantParams3 &fp) {
       ScaleParam3 out;
@@ -320,8 +359,9 @@ void quantizeFloatToIntPerStep(const float *src_dev,
                                const int32_t *zero_point_per_t,
                                int time_step_size);
 
+template<typename T>
 void computeWeightSum(
-    const int8_t *W_q,// [out_dim, in_dim] 权重量化矩阵
+    const T *W_q,// [out_dim, in_dim] 权重量化矩阵
     int32_t *weight_sum,// [out_dim] 输出数组
     int out_dim,// 输出通道数 (M)
     int in_dim,// 输入通道数 (K)
@@ -447,7 +487,7 @@ constexpr int32_t INV_QMAX = (1 << 15) / 127; // 257 in Q15
 // 输入: 当前步隐藏态整数张量 h_t_int[]
 // 输出: 更新后的scale参数 (M_new, shift_new)
 inline void updateHScaleInt8(const int8_t *h_t, size_t size,
-                      int32_t &M_prev, int &shift_prev) {
+                             int32_t &M_prev, int &shift_prev) {
     // 1. 求当前步最大值
     int max_abs = 0;
     for (size_t i = 0; i < size; ++i)

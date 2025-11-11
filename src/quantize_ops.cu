@@ -145,8 +145,9 @@ void initLut() {
 
 namespace kernel {
 
+template<typename T>
 __global__ void computeWeightSumTiled(
-    const int8_t *__restrict__ W_q, // [out_dim, in_dim] 权重量化矩阵
+    const T *__restrict__ W_q, // [out_dim, in_dim] 权重量化矩阵
     int32_t *__restrict__ weight_sum, // [out_dim] 输出数组
     int out_dim, // 输出通道数 (M)
     int in_dim // 输入通道数 (K)
@@ -181,8 +182,9 @@ __global__ void computeWeightSumTiled(
     }
 }
 
+template<typename T>
 __global__ void computeWeightSum(
-    const int8_t *__restrict__ W_q,   // [out_dim, in_dim] 权重量化矩阵
+    const T *__restrict__ W_q,   // [out_dim, in_dim] 权重量化矩阵
     int32_t *__restrict__ weight_sum, // [out_dim] 输出数组
     int out_dim,                      // 输出通道数 (M)
     int in_dim                        // 输入通道数 (K)
@@ -191,13 +193,27 @@ __global__ void computeWeightSum(
     if (row >= out_dim) return;
 
     int32_t sum = 0;
-    const int8_t *row_ptr = W_q + row * in_dim;
+    const T *row_ptr = W_q + row * in_dim;
 #pragma unroll 8
     for (int j = 0; j < in_dim; ++j) {
         sum += static_cast<int32_t>(row_ptr[j]);
     }
     weight_sum[row] = sum;
 }
+
+template __global__ void computeWeightSum<int8_t>(
+    const int8_t *__restrict__ W_q,   // [out_dim, in_dim] 权重量化矩阵
+    int32_t *__restrict__ weight_sum, // [out_dim] 输出数组
+    int out_dim,                      // 输出通道数 (M)
+    int in_dim                        // 输入通道数 (K)
+);
+
+template __global__ void computeWeightSum<int16_t>(
+    const int16_t *__restrict__ W_q,   // [out_dim, in_dim] 权重量化矩阵
+    int32_t *__restrict__ weight_sum, // [out_dim] 输出数组
+    int out_dim,                      // 输出通道数 (M)
+    int in_dim                        // 输入通道数 (K)
+);
 
 __global__ void applyZeroPointCompensation2D(
     int32_t *__restrict__ Y_int32,
@@ -217,8 +233,9 @@ __global__ void applyZeroPointCompensation2D(
 
 } // kernel namespace
 
+template<typename T>
 void computeWeightSum(
-    const int8_t *W_q,// [out_dim, in_dim] 权重量化矩阵
+    const T *W_q,// [out_dim, in_dim] 权重量化矩阵
     int32_t *weight_sum,// [out_dim] 输出数组
     int out_dim,// 输出通道数 (M)
     int in_dim,// 输入通道数 (K)
@@ -236,6 +253,22 @@ void computeWeightSum(
         kernel::computeWeightSum<<<blocks, threads, 0, stream>>>(W_q, weight_sum, out_dim, in_dim);
     }
 }
+
+template void computeWeightSum<int8_t>(
+    const int8_t *W_q,// [out_dim, in_dim] 权重量化矩阵
+    int32_t *weight_sum,// [out_dim] 输出数组
+    int out_dim,// 输出通道数 (M)
+    int in_dim,// 输入通道数 (K)
+    cudaStream_t stream
+);
+
+template void computeWeightSum<int16_t>(
+    const int16_t *W_q,// [out_dim, in_dim] 权重量化矩阵
+    int32_t *weight_sum,// [out_dim] 输出数组
+    int out_dim,// 输出通道数 (M)
+    int in_dim,// 输入通道数 (K)
+    cudaStream_t stream
+);
 
 void applyZeroPointCompensation2D(
     int32_t *Y_int32,
@@ -292,7 +325,7 @@ QuantParams calculateQuantParams(
     size_t size,
     bool symmetric) {
 
-    QuantParams params{};
+    QuantParams params;
 
     if (data == nullptr || size == 0) {
         params.scale = 1.0f;
@@ -334,6 +367,8 @@ QuantParams calculateQuantParams(
         params.zero_point = static_cast<int32_t>(std::round(int_min - min_val / params.scale));
         params.zero_point = std::clamp(params.zero_point, int_min, int_max);
     }
+
+    return params;
 }
 
 template QuantParams calculateQuantParams<int8_t>(

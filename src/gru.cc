@@ -512,6 +512,7 @@ int main() {
 
     GruQuantScalesFixed gruQuantScalesFixed;
     gruQuantScalesFixed.initialize(gruQuantScales);
+    gruQuantScalesFixed.h[0] = floatScaleToFixed(gruQuantScales.h_scale[0]);
 
     GruInferenceQuant(W_quant,
                       R_quant,
