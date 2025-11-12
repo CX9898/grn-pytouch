@@ -264,7 +264,7 @@ __device__ __forceinline__ int8_t tanh_int16_lut(int16_t x, const int8_t* lut) {
 }
 ```
 
-> 疑问:
+**疑问:**
 > 1. 量化方式选择? 对称量化(权重全用对称); 非对称量化; 混合量化(V). 给定参数选择其他选择是否对称量化
 > - > 选择混合量化. 权重使用对称量化, 其他参数则给定参数选择是否对称量化.
 > 2. scale是传入进来还是内部计算得到? scale = (max_float - min_float) / (max_int - min_int)
@@ -275,20 +275,33 @@ __device__ __forceinline__ int8_t tanh_int16_lut(int16_t x, const int8_t* lut) {
 > - > 每个门控的都不同
 
 
+**新的流程:**
 
+- 第一步先效验: 运行一遍浮点GRU得到量化参数
 
+- 第二步运行量化GRU, 使用固定量化参数, 不再动态计算
 
+- 验证方法:
+    1. 创建随机输入
+    2. 运行一遍浮点GRU(haste)得到结果1
+    3. 从浮点GRU中得到量化参数
+    4. 使用固定量化参数和相同输入运行量化GRU得到结果2
+    5. 将结果2使用量化参数反量化到浮点结果3
+    6. 将结果1和结果3计算余弦相似度判断正确性
 
-
-
-
-
-
-
-
-
-
-
+**疑问:**
+> - 实际流程中, 量化参数是我这里得到, 还是输入进来?
+> - 量化参数是 per-channel 的吗? 例如 W_scale.size = hidden_size * 3 ?
+> - Rh 和 br 是设置为同一个scale吗? Wx 和 bx 是设置为同一个scale吗?
+> - 对称和非对称量化的选择:
+>   - x: 非对称
+>   - h: 
+>   - W: 对称
+>   - R: 对称
+>   - z:
+>   - r:
+>   - g:
+> - 门控量化计算检查
 
 ## GruTrain
 
@@ -325,6 +338,6 @@ __device__ __forceinline__ int8_t tanh_int16_lut(int16_t x, const int8_t* lut) {
 
         5.
     4. 计算新计算出来的h的scale(M,shift)
-   
+
    > - h 是对称量化?
    > - 是不是只需要计算h的scale
