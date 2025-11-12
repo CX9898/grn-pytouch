@@ -31,17 +31,14 @@ __device__ __forceinline__ int8_t computeZ(
 //    const int32_t bx_aligned = dev::rescale(bx_val,
 //                                            rescaleParams.bx_to_Wx.M[gate_idx],
 //                                            rescaleParams.bx_to_Wx.shift[gate_idx]);
-//    const int32_t br_aligned = dev::rescale(br_val,
-//                                            rescale_params.Rh_to_Wx[hidden_idx].M[gate_idx],
-//                                            rescale_params.Rh_to_Wx[hidden_idx].shift[gate_idx]);
 
     // 累加求和
     const int32_t tmp_i32 = Wx_val + Rh_aligned + bx_val;
 
     // 量化回 int8
     const int8_t tmp_i8 = dev::quantize_i32_to_i8(tmp_i32,
-                                                  rescale_params.Wx_to_out[hidden_idx].M[0],
-                                                  rescale_params.Wx_to_out[hidden_idx].shift[0]);
+                                                  rescale_params.Wx_to_z_pre[hidden_idx].M,
+                                                  rescale_params.Wx_to_z_pre[hidden_idx].shift);
 
     return tmp_i8;
 }
@@ -61,17 +58,14 @@ __device__ __forceinline__ int8_t computeR(
 //    const int32_t bx_aligned = dev::rescale(bx_val,
 //                                            rescaleParams.bx_to_Wx.M[gate_idx],
 //                                            rescaleParams.bx_to_Wx.shift[gate_idx]);
-//    const int32_t br_aligned = dev::rescale(br_val,
-//                                            rescale_params.Rh_to_Wx[hidden_idx].M[gate_idx],
-//                                            rescale_params.Rh_to_Wx[hidden_idx].shift[gate_idx]);
 
     // 累加求和
     const int32_t tmp_i32 = Wx_val + Rh_aligned + bx_val;
 
     // 量化回 int8
     const int8_t tmp_i8 = dev::quantize_i32_to_i8(tmp_i32,
-                                                  rescale_params.Wx_to_out[hidden_idx].M[1],
-                                                  rescale_params.Wx_to_out[hidden_idx].shift[1]);
+                                                  rescale_params.Wx_to_g_pre[hidden_idx].M,
+                                                  rescale_params.Wx_to_g_pre[hidden_idx].shift);
     return tmp_i8;
 }
 
@@ -99,8 +93,8 @@ __device__ __forceinline__ int8_t computeG(
 
     // 量化回 int8
     const int8_t tmp_i8 = dev::quantize_i32_to_i8(tmp_i32,
-                                                  rescale_params.Wx_to_out[hidden_idx].M[2],
-                                                  rescale_params.Wx_to_out[hidden_idx].shift[2]);
+                                                  rescale_params.Wx_to_g_pre[hidden_idx].M,
+                                                  rescale_params.Wx_to_g_pre[hidden_idx].shift);
     return tmp_i8;
 }
 
@@ -113,8 +107,8 @@ __device__ __forceinline__ int8_t computeH(
     const QuantGRUReScale &rescale_params
 ) {
     const int32_t zh_aligned = dev::rescale(static_cast<int32_t>(z) * static_cast<int32_t>(h_old),
-                                            rescale_params.zh_old_to_h_out[hidden_idx].M,
-                                            rescale_params.zh_old_to_h_out[hidden_idx].shift);
+                                            rescale_params.zh_in_to_h_out[hidden_idx].M,
+                                            rescale_params.zh_in_to_h_out[hidden_idx].shift);
     const int32_t zg_aligned = dev::rescale(static_cast<int32_t>(127 - z) * static_cast<int32_t>(g),
                                             rescale_params.zg_to_h_out[hidden_idx].M,
                                             rescale_params.zg_to_h_out[hidden_idx].shift);
@@ -391,25 +385,59 @@ void ForwardPassQuant<T>::IterateInternal(
 
 template<typename T>
 void ForwardPassQuant<T>::setRescaleParam(const QuantGRUScales &quantGruScales) {
-    std::vector<ScaleParam> Rh_z_to_Wx_z;
-    std::vector<ScaleParam> Rh_r_to_Wx_r;
-    std::vector<ScaleParam> rRh_g_to_Wx_g;
-    std::vector<ScaleParam3> Wx_to_out; // 三个门: z, r, g
-    std::vector<ScaleParam> zh_in_to_h_out;
-    std::vector<ScaleParam> zg_to_h_out;
+    const int steps = quantGruScales.steps;
+    const int hidden = quantGruScales.hidden;
+    const int size = steps * hidden;
+    std::vector<ScaleParam> Rh_z_to_Wx_z(size);
+    std::vector<ScaleParam> Rh_r_to_Wx_r(size);
+    std::vector<ScaleParam> rRh_g_to_Wx_g(size);
+    std::vector<ScaleParam> Wx_to_z_pre(size);
+    std::vector<ScaleParam> Wx_to_r_pre(size);
+    std::vector<ScaleParam> Wx_to_g_pre(size);
+    std::vector<ScaleParam> zh_in_to_h_out(size);
+    std::vector<ScaleParam> zg_to_h_out(size);
 
-    for (int t = 0; t < quantGruScales.steps; ++t) {
-        for (int hidden_idx = 0; hidden_idx < quantGruScales.hidden; ++hidden_idx) {
-            const int Wx_offset = t * quantGruScales.hidden * 3 + hidden_idx;
-            const float Wx_z = quantGruScales.Wx[Wx_offset];
-            const float Wx_r = quantGruScales.Wx[Wx_offset + 1];
-            const float Wx_g = quantGruScales.Wx[Wx_offset + 2];
+    for (int t = 0; t < steps; ++t) {
+        const float h_in = quantGruScales.h[t];
+        const float h_out = quantGruScales.h[t + 1];
 
-            const float Rh_z = quantGruScales.Rh[Wx_offset];
-            const float Rh_r = quantGruScales.Rh[Wx_offset + 1];
-            const float Rh_g = quantGruScales.Rh[Wx_offset + 2];
+        for (int hidden_idx = 0; hidden_idx < hidden; ++hidden_idx) {
+            const int idx = t * hidden + hidden_idx;
+            const float Wx_z = quantGruScales.Wx_z[idx];
+            const float Wx_r = quantGruScales.Wx_r[idx];
+            const float Wx_g = quantGruScales.Wx_g[idx];
+
+            const float Rh_z = quantGruScales.Rh_z[idx];
+            const float Rh_r = quantGruScales.Rh_r[idx];
+            const float Rh_g = quantGruScales.Rh_g[idx];
+
+            const float z_pre = quantGruScales.z_pre[idx];
+            const float r_pre = quantGruScales.r_pre[idx];
+            const float g_pre = quantGruScales.g_pre[idx];
+
+            const float z_out = quantGruScales.z_out[idx];
+            const float r_out = quantGruScales.r_out[idx];
+            const float g_out = quantGruScales.g_out[idx];
+
+            Rh_z_to_Wx_z[idx] = computeRescaleParam(Rh_z, Wx_z);
+            Rh_r_to_Wx_r[idx] = computeRescaleParam(Rh_r, Wx_r);
+            rRh_g_to_Wx_g[idx] = computeRescaleParam(r_out * Rh_g, Wx_g);
+            Wx_to_z_pre[idx] = computeRescaleParam(Wx_z, z_pre);
+            Wx_to_r_pre[idx] = computeRescaleParam(Wx_r, r_pre);
+            Wx_to_g_pre[idx] = computeRescaleParam(Wx_g, g_pre);
+            zh_in_to_h_out[idx] = computeRescaleParam(z_out * h_in, h_out);
+            zg_to_h_out[idx] = computeRescaleParam(z_out * g_out, h_out);
         }
     }
+
+    h2d(rescale_param_.Rh_z_to_Wx_z, Rh_z_to_Wx_z);
+    h2d(rescale_param_.Rh_r_to_Wx_r, Rh_r_to_Wx_r);
+    h2d(rescale_param_.rRh_g_to_Wx_g, rRh_g_to_Wx_g);
+    h2d(rescale_param_.Wx_to_z_pre, Wx_to_z_pre);
+    h2d(rescale_param_.Wx_to_r_pre, Wx_to_r_pre);
+    h2d(rescale_param_.Wx_to_g_pre, Wx_to_g_pre);
+    h2d(rescale_param_.zh_in_to_h_out, zh_in_to_h_out);
+    h2d(rescale_param_.zg_to_h_out, zg_to_h_out);
 }
 
 // C = input_size(输入维度), H = hidden_size(隐藏层维度),

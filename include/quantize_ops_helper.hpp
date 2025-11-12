@@ -40,8 +40,10 @@ struct QuantGRUReScale { // size = time_steps * hidden
   dev::vector<ScaleParam> Rh_z_to_Wx_z;
   dev::vector<ScaleParam> Rh_r_to_Wx_r;
   dev::vector<ScaleParam> rRh_g_to_Wx_g;
-  dev::vector<ScaleParam3> Wx_to_out; // 三个门: z, r, g
-  dev::vector<ScaleParam> zh_old_to_h_out;
+  dev::vector<ScaleParam> Wx_to_z_pre;
+  dev::vector<ScaleParam> Wx_to_r_pre;
+  dev::vector<ScaleParam> Wx_to_g_pre;
+  dev::vector<ScaleParam> zh_in_to_h_out;
   dev::vector<ScaleParam> zg_to_h_out;
 };
 
@@ -50,8 +52,12 @@ struct QuantGRUScales {
   int hidden;
   std::vector<float> x; // size = steps
   std::vector<float> h; // size = steps + 1
-  std::vector<float> Wx; // size = steps * hidden * 3
-  std::vector<float> Rh; // size = (steps + 1) * hidden * 3
+  std::vector<float> Wx_z; // size = steps * hidden
+  std::vector<float> Wx_r; // size = steps * hidden
+  std::vector<float> Wx_g; // size = steps * hidden
+  std::vector<float> Rh_z; // size = (steps + 1) * hidden
+  std::vector<float> Rh_r; // size = (steps + 1) * hidden
+  std::vector<float> Rh_g; // size = (steps + 1) * hidden
   std::vector<float> z_pre; // size = steps * hidden
   std::vector<float> r_pre; // size = steps * hidden
   std::vector<float> g_pre; // size = steps * hidden
@@ -176,6 +182,34 @@ inline ScaleParam floatScaleToFixed(float scale) {
         shift = 0;
     }
     return {M, shift};
+}
+
+/**
+ * @brief 计算将 Rh 结果重新缩放到 Wx 的定点 rescale 参数
+ * @param scale_src   原始的浮点 scale
+ * @param scale_dst   目标的浮点 scale
+ * @param M           输出：定点乘法器（int32）
+ * @param shift       输出：右移位数（int）
+ */
+inline ScaleParam computeRescaleParam(
+    float scale_src,
+    float scale_dst) {
+    ScaleParam scaleParam;
+    // 计算浮点比例
+    double ratio = static_cast<double>(scale_src) / static_cast<double>(scale_dst);
+
+    // 把比例转为 2^shift 形式
+    int exp;
+    double mantissa = std::frexp(ratio, &exp);  // ratio = mantissa * 2^exp, mantissa∈[0.5,1)
+
+    // 将mantissa放大为整数
+    const double SCALE_INT_RANGE = static_cast<double>(1 << 31);  // Q31 格式
+    int64_t M64 = static_cast<int64_t>(std::round(mantissa * SCALE_INT_RANGE));
+
+    // 调整 shift，使等式成立：ratio ≈ M / 2^(shift)
+    scaleParam.M = static_cast<int32_t>(M64);
+    scaleParam.shift = 31 - exp;
+    return scaleParam;
 }
 
 struct GruQuantScalesFixed {

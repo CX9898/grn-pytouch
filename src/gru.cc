@@ -207,8 +207,7 @@ void GruInferenceQuant(const Tensor2i8 &W,
                        const Tensor1i32 &bx,
                        const Tensor1i32 &br,
                        const Tensor3i8 &x,
-                       const std::vector<RescaleParamsPerStep> &rescaleParams,
-                       const GruQuantScalesFixed &gruQuantScalesFixed,
+                       const QuantGRUScales quant_gru_scales,
                        Tensor3i8 &h // (time_steps + 1) * batch_size * hidden_size
 ) {
     const int time_steps = x.dimension(2);
@@ -236,7 +235,7 @@ void GruInferenceQuant(const Tensor2i8 &W,
             false, // training
             batch_size, input_size, hidden_size, g_blas_handle);
 
-        // TODO: 得到
+        forward.setRescaleParam(quant_gru_scales);
 
         forward.Run(time_steps, W_dev.data, R_dev.data, bx_dev.data, br_dev.data,
                     x_dev.data, h_dev.data, nullptr, tmp_Wx_dev.data, tmp_Rh_dev.data,
@@ -274,6 +273,7 @@ void GruInference(const Tensor2f &W,
         ScopeTimer t("Inference:");
 
         gru::ForwardPass<float> forward = gru::ForwardPass<float>(
+            false, // calibration
             false, // training
             batch_size, input_size, hidden_size, g_blas_handle);
 
@@ -319,6 +319,7 @@ void GruTrain(const Tensor2f &W, // 输入到隐藏层的权重矩阵. [input_si
     {
         ScopeTimer t("Train forward:");
         gru::ForwardPass<float> forward = gru::ForwardPass<float>(
+            false, // calibration
             true,  // training
             batch_size,
             input_size,
@@ -446,7 +447,7 @@ void calibrateGruScales(const Tensor2f &W,
                         const Tensor1f &bx,
                         const Tensor1f &br,
                         const Tensor3f &x,
-                        GruQuantScales &gruQuantScales
+                        QuantGRUScales &quant_gru_scales
 ) {
     const int time_steps = x.dimension(2);
     const int batch_size = x.dimension(1);
@@ -463,12 +464,13 @@ void calibrateGruScales(const Tensor2f &W,
 
     device_ptr<Tensor2f> h_dev((time_steps + 1) * batch_size * hidden_size);
     device_ptr<Tensor3f> tmp_Wx_dev(time_steps * batch_size * hidden_size * 3);
-    device_ptr<Tensor2f> tmp_Rh_dev(batch_size * hidden_size * 3);
+    device_ptr<Tensor2f> tmp_Rh_dev(time_steps * batch_size * hidden_size * 3);
     device_ptr<Tensor3f> v_dev(time_steps * batch_size * hidden_size * 4);
 
     h_dev.zero();
 
     gru::ForwardPass<float> forward = gru::ForwardPass<float>(
+        true, // calibration
         true,  // training
         batch_size,
         input_size,
@@ -585,13 +587,16 @@ int main() {
     gruQuantScalesFixed.initialize(gruQuantScales);
     gruQuantScalesFixed.h[0] = floatScaleToFixed(gruQuantScales.h_scale[0]);
 
+    QuantGRUScales quant_gru_scales;
+
+    calibrateGruScales<int8_t>(W, R, bx, br, x, quant_gru_scales);
+
     GruInferenceQuant(W_quant,
                       R_quant,
                       bx_quant,
                       br_quant,
                       x_quant,
-                      rescaleParams,
-                      gruQuantScalesFixed,
+                      quant_gru_scales,
                       h_quant_inference);
 
     { // Test

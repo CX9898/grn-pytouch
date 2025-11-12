@@ -64,10 +64,19 @@ __device__ __forceinline__ int8_t quantize_i32_to_i8(
     const int32_t M,
     const int32_t shift,
     const int32_t zero_point = 0) {
-    int32_t tmp = (value * M + (1 << (shift - 1))) >> shift;
-    tmp += zero_point;
-    tmp = max(-128, min(127, tmp));
-    return static_cast<int8_t>(tmp);
+    int64_t tmp64;
+    if (shift > 0) {
+        tmp64 = static_cast<int64_t>(value) * M + (1LL << (shift - 1));
+        tmp64 >>= shift;
+    } else if (shift == 0) {
+        tmp64 = static_cast<int64_t>(value) * M;
+    } else { // shift < 0
+        tmp64 = static_cast<int64_t>(value) * M << (-shift);
+    }
+
+    tmp64 += zero_point;
+    tmp64 = max(static_cast<int64_t>(-128), min(static_cast<int64_t>(127), tmp64));
+    return static_cast<int8_t>(tmp64);
 }
 
 __device__ __forceinline__ int16_t quantize_i32_to_i16(
