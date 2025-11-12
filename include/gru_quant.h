@@ -28,13 +28,7 @@ class ForwardPassQuant {
   // Blocks until all iterations have completed executing on the GPU.
   ~ForwardPassQuant();
 
-  void SetQuantParams(const std::vector<RescaleParamsPerStep> &rescaleParam) {
-      rescaleParam_ = rescaleParam;
-  }
-
-  void SetGruQuantScales(const GruQuantScalesFixed &gruQuantScalesFixed) {
-      gruQuantScales_ = gruQuantScalesFixed;
-  }
+  void setRescaleParam(const QuantGRUScales &quantGruScales);
 
   // Performs one forward iteration of the GRU cell.
   //
@@ -108,8 +102,8 @@ class ForwardPassQuant {
   struct private_data;
   private_data *data_;
 
-  std::vector<RescaleParamsPerStep> rescaleParam_;
-  GruQuantScalesFixed gruQuantScales_;  // 用于动态更新 rescale 参数
+//  GruQuantScalesFixed gruQuantScales_;  // 用于动态更新 rescale 参数
+  QuantGRUReScale rescale_param_;
 };
 
 template<typename T>

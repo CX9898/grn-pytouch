@@ -1,6 +1,9 @@
 #pragma once
 
 #include <vector>
+#include <algorithm>
+
+#include "devVector.h"
 
 struct QuantParams {
   float scale;
@@ -10,6 +13,53 @@ struct QuantParams {
 struct QuantParams3 { // 对应三个门: z, r, g
   QuantParams gate[3]; // 每个门一个独立的量化参数
 };
+
+// scale 参数结构体
+struct ScaleParam {
+  int32_t M;  // M, 整数乘法系数，对齐到目标 scale 使用
+  int shift;         // shift, 右移位数，用于 CUDA kernel
+};
+
+struct ScaleParam3 { // 对应三个门: z, r, g
+  int32_t M[3];         // M, 整数乘法系数，对齐到目标 scale 使用
+  int shift[3];         // shift, 右移位数，用于 CUDA kernel
+};
+
+struct GRUQuantScale {
+  std::vector<float> Wx_scale; // size = time_steps * hidden * 3
+  std::vector<float> Rh_scale; // size = time_steps * hidden * 3
+  std::vector<float> z_pre; // size = time_steps * hidden
+  std::vector<float> r_pre; // size = time_steps * hidden
+  std::vector<float> g_pre; // size = time_steps * hidden
+  std::vector<float> z_out; // size = time_steps * hidden
+  std::vector<float> r_out; // size = time_steps * hidden
+  std::vector<float> g_out; // size = time_steps * hidden
+};
+
+struct QuantGRUReScale { // size = time_steps * hidden
+  dev::vector<ScaleParam> Rh_z_to_Wx_z;
+  dev::vector<ScaleParam> Rh_r_to_Wx_r;
+  dev::vector<ScaleParam> rRh_g_to_Wx_g;
+  dev::vector<ScaleParam3> Wx_to_out; // 三个门: z, r, g
+  dev::vector<ScaleParam> zh_old_to_h_out;
+  dev::vector<ScaleParam> zg_to_h_out;
+};
+
+struct QuantGRUScales {
+  int steps;
+  int hidden;
+  std::vector<float> x; // size = steps
+  std::vector<float> h; // size = steps + 1
+  std::vector<float> Wx; // size = steps * hidden * 3
+  std::vector<float> Rh; // size = (steps + 1) * hidden * 3
+  std::vector<float> z_pre; // size = steps * hidden
+  std::vector<float> r_pre; // size = steps * hidden
+  std::vector<float> g_pre; // size = steps * hidden
+  std::vector<float> z_out; // size = steps * hidden
+  std::vector<float> r_out; // size = steps * hidden
+  std::vector<float> g_out; // size = steps * hidden
+};
+
 
 struct GruQuantScales {
   std::vector<float> x_scale;  // 每步一组 scale/zp，非对称
@@ -23,7 +73,7 @@ struct GruQuantScales {
   QuantParams3 bx; // 分为三个门: z, r, g
   QuantParams3 br; // 分为三个门: z, r, g
 
-  std::vector<QuantParams3> Wx;   // 每步一个 scale, 且分为三个门: z, r, g
+  std::vector<QuantParams3> Wx;   // 分每步每Hidden, 且分为三个门: z, r, g
 //  std::vector<QuantParams3> Rh;   // 每步一个 scale, 且分为三个门: z, r, g
 
   // --- 激活输入 ---
@@ -37,17 +87,6 @@ struct GruQuantScales {
   QuantParams g;  // 输出门 g
 };
 
-
-// Rescale 参数结构体
-struct ScaleParam {
-  int32_t M;  // M, 整数乘法系数，对齐到目标 scale 使用
-  int shift;         // shift, 右移位数，用于 CUDA kernel
-};
-
-struct ScaleParam3 { // 对应三个门: z, r, g
-  int32_t M[3];         // M, 整数乘法系数，对齐到目标 scale 使用
-  int shift[3];         // shift, 右移位数，用于 CUDA kernel
-};
 
 /**
  * @brief 组合两个 scale 参数，计算结果的定点比例系数
@@ -138,7 +177,6 @@ inline ScaleParam floatScaleToFixed(float scale) {
     }
     return {M, shift};
 }
-
 
 struct GruQuantScalesFixed {
   // 输入 x（非对称量化，每步可能不同）
@@ -232,6 +270,105 @@ struct GruQuantScalesFixed {
   }
 };
 
+
+/**
+ * @brief 计算一个张量的定点缩放参数对齐到另一个张量的 scale
+ * @param M_src       源张量的 M
+ * @param shift_src   源张量的 shift
+ * @param M_dst       目标张量的 M
+ * @param shift_dst   目标张量的 shift
+ * @param N           固定精度（通常取31）
+ * @return            对齐参数 (M_align, shift_align)
+ */
+inline ScaleParam computeRescaleTo(
+    const ScaleParam src,
+    const ScaleParam dst,
+    int N = 31) {
+    ScaleParam p;
+
+    // 检查边界情况
+    if (dst.M == 0 || src.M == 0) {
+        p.M = 1;
+        p.shift = 0;
+        return p;
+    }
+
+    // 计算新的 M （放大到 QN 精度后再除）
+    // scale_ratio = (src.M / (2^src.shift)) / (dst.M / (2^dst.shift))
+    //             = (src.M * 2^dst.shift) / (dst.M * 2^src.shift)
+    // 使用 QN 精度：M_rescale = (2^N * src.M) / dst.M
+    // shift_rescale = N + src.shift - dst.shift
+    // 这样 rescale 后的 scale = M_rescale / (2^shift_rescale) = (src.M * 2^dst.shift) / (dst.M * 2^src.shift)
+
+    // 计算 numerator = 2^N * src.M
+    int64_t numerator = (int64_t(1) << N) * (int64_t) src.M;
+
+    // 四舍五入除法
+    int64_t tmp = (numerator + (dst.M / 2)) / dst.M;
+
+    // 检查溢出
+    if (tmp > std::numeric_limits<int32_t>::max()) {
+        tmp = std::numeric_limits<int32_t>::max();
+    } else if (tmp < std::numeric_limits<int32_t>::min()) {
+        tmp = std::numeric_limits<int32_t>::min();
+    }
+
+    p.M = static_cast<int32_t>(tmp);
+    p.shift = N + src.shift - dst.shift;
+
+    // 检查 shift 是否合理
+    if (p.shift < 0 || p.shift > 63) {
+        // 如果 shift 不合理，使用默认值
+        p.M = 1;
+        p.shift = 0;
+    }
+
+    return p;
+}
+
+/**
+ * @brief 对齐 Rh 的 scale 到 Wx 的 scale，计算 rescale 参数
+ * @param Rh        Rh 的量化参数 (三个门)
+ * @param Wx        Wx 的量化参数 (三个门，目标 scale)
+ * @return          Rh_to_Wx 的 rescale 参数 (三个门)
+ *
+ * 说明：
+ * - Rh 的 scale = M_Rh / (2^shift_Rh)
+ * - Wx 的 scale = M_Wx / (2^shift_Wx)
+ * - 要将 Rh 对齐到 Wx，需要：Rh_aligned = Rh_val * (M_Rh/M_Wx) * (2^(shift_Wx - shift_Rh))
+ * - 这个函数计算的是 rescale 参数，使得 rescale(Rh_val, M, shift) 的结果 scale 等于 Wx 的 scale
+ */
+inline ScaleParam3 alignRhToWxShift(const ScaleParam3 &Rh, const ScaleParam3 &Wx) {
+    ScaleParam3 Rh_to_Wx;
+
+    for (int i = 0; i < 3; ++i) {
+        // 检查边界情况
+        if (Wx.M[i] == 0 || Rh.M[i] == 0) {
+            // 如果 M 为 0，使用默认值
+            Rh_to_Wx.M[i] = 1;
+            Rh_to_Wx.shift[i] = 0;
+            continue;
+        }
+
+        // 使用 computeRescaleTo 来计算对齐参数
+        // 这将 Rh 的 scale 对齐到 Wx 的 scale
+        ScaleParam src{Rh.M[i], Rh.shift[i]};
+        ScaleParam dst{Wx.M[i], Wx.shift[i]};
+        ScaleParam aligned = computeRescaleTo(src, dst, 31);
+
+        // 检查结果是否有效
+        if (aligned.M == 0) {
+            // 如果计算出的 M 为 0，使用默认值
+            Rh_to_Wx.M[i] = 1;
+            Rh_to_Wx.shift[i] = 0;
+        } else {
+            Rh_to_Wx.M[i] = aligned.M;
+            Rh_to_Wx.shift[i] = aligned.shift;
+        }
+    }
+
+    return Rh_to_Wx;
+}
 
 /**
  * @brief 每个时间步（step）对应的量化重标定参数集合，用于 GRU 三个门（z、r、g）的定点缩放对齐。
@@ -430,29 +567,11 @@ void calculateScaleZeroPointFromDevice(
     bool symmetric = true,
     cudaStream_t stream = 0);
 
-/**
- * @brief 计算一个张量的定点缩放参数对齐到另一个张量的 scale
- * @param M_src       源张量的 M
- * @param shift_src   源张量的 shift
- * @param M_dst       目标张量的 M
- * @param shift_dst   目标张量的 shift
- * @param N           固定精度（通常取31）
- * @return            对齐参数 (M_align, shift_align)
- */
-inline ScaleParam computeRescaleTo(
-    const ScaleParam src,
-    const ScaleParam dst,
-    int N = 31) {
-    ScaleParam p;
-    // 计算新的 M （放大到 QN 精度后再除）
-    int64_t tmp = ((int64_t(1) << N) * src.M + (dst.M / 2)) / dst.M; // 四舍五入
-    p.M = static_cast<int32_t>(tmp);
-    p.shift = N + src.shift - dst.shift;
-    return p;
-}
-
 template<typename T>
 T findMaxValueFromDev(const T *dev_data, size_t size);
+
+template<typename T>
+T findMinValueFromDev(const T *dev_data, size_t size);
 
 /**
  * @brief 使用 (M, shift) 参数将量化值反量化为浮点数
@@ -508,3 +627,40 @@ inline void updateHScaleInt8(const int8_t *h_t, size_t size,
     // shift_prev 可视范围动态调整（或保持不变）
 }
 
+
+/**
+ * @brief 计算量化参数（对称或非对称）
+ * @tparam QuantT   目标量化类型（如 int8_t 或 int16_t）
+ * @param data      输入浮点数据指针
+ * @param size      数据长度
+ * @param symmetric 是否使用对称量化（默认为 true）
+ * @return QuantParams 量化参数结构体
+ */
+template<typename QuantT>
+inline QuantParams calculateQuantParams(float max_val, float min_val, bool symmetric = true) {
+    QuantParams params;
+
+    // -----------------------------
+    // 获取目标类型范围
+    // -----------------------------
+    const int32_t int_min = static_cast<int32_t>(std::numeric_limits<QuantT>::min());
+    const int32_t int_max = static_cast<int32_t>(std::numeric_limits<QuantT>::max());
+
+    // -----------------------------
+    // 根据模式计算 scale 和 zero_point
+    // -----------------------------
+    if (symmetric) {
+        // 对称量化：zero_point = 0
+        float abs_max = std::max(std::abs(max_val), std::abs(min_val));
+        params.scale = abs_max / static_cast<float>(int_max);
+        params.zero_point = 0;
+    } else {
+        // 非对称量化：线性映射 [min_val, max_val] → [int_min, int_max]
+        params.scale = (max_val - min_val) / static_cast<float>(int_max - int_min);
+        if (params.scale < 1e-12f) params.scale = 1e-12f; // 避免除0
+        params.zero_point = static_cast<int32_t>(std::round(int_min - min_val / params.scale));
+        params.zero_point = std::clamp(params.zero_point, int_min, int_max);
+    }
+
+    return params;
+}

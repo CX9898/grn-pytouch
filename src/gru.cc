@@ -8,7 +8,7 @@
 #include <unsupported/Eigen/CXX11/Tensor>
 #include <vector>
 
-#include "devVector.cuh"
+#include "devVector.h"
 #include "device_ptr.h"
 #include "gru.h"
 #include "gru_quant.h"
@@ -236,8 +236,7 @@ void GruInferenceQuant(const Tensor2i8 &W,
             false, // training
             batch_size, input_size, hidden_size, g_blas_handle);
 
-        forward.SetQuantParams(rescaleParams);
-        forward.SetGruQuantScales(gruQuantScalesFixed);
+        // TODO: 得到
 
         forward.Run(time_steps, W_dev.data, R_dev.data, bx_dev.data, br_dev.data,
                     x_dev.data, h_dev.data, nullptr, tmp_Wx_dev.data, tmp_Rh_dev.data,
@@ -286,7 +285,6 @@ void GruInference(const Tensor2f &W,
     h_dev.ToHost(h);
 }
 
-
 void GruTrain(const Tensor2f &W, // 输入到隐藏层的权重矩阵. [input_size,
     // hidden_size * 3] 对应三个门
               const Tensor2f &R, // 隐藏层到隐藏层的循环权重矩阵
@@ -302,60 +300,72 @@ void GruTrain(const Tensor2f &W, // 输入到隐藏层的权重矩阵. [input_si
     const int batch_size = x.dimension(1);
     const int input_size = x.dimension(0);
     const int hidden_size = R.dimension(1);
-    if (!enable_quantitative) { // 非量化
-        // Copy weights over to GPU.
-        device_ptr<Tensor2f> W_dev(W);
-        device_ptr<Tensor2f> R_dev(R);
-        device_ptr<Tensor1f> bx_dev(bx);
-        device_ptr<Tensor1f> br_dev(br);
-        device_ptr<Tensor3f> x_dev(x);
-        device_ptr<Tensor3f> dh_new_dev(dh_new);
 
-        device_ptr<Tensor2f> h_dev((time_steps + 1) * batch_size * hidden_size);
-        device_ptr<Tensor3f> tmp_Wx_dev(time_steps * batch_size * hidden_size * 3);
-        device_ptr<Tensor2f> tmp_Rh_dev(batch_size * hidden_size * 3);
-        device_ptr<Tensor3f> v_dev(time_steps * batch_size * hidden_size * 4);
+    // Copy weights over to GPU.
+    device_ptr<Tensor2f> W_dev(W);
+    device_ptr<Tensor2f> R_dev(R);
+    device_ptr<Tensor1f> bx_dev(bx);
+    device_ptr<Tensor1f> br_dev(br);
+    device_ptr<Tensor3f> x_dev(x);
+    device_ptr<Tensor3f> dh_new_dev(dh_new);
 
-        h_dev.zero();
+    device_ptr<Tensor2f> h_dev((time_steps + 1) * batch_size * hidden_size);
+    device_ptr<Tensor3f> tmp_Wx_dev(time_steps * batch_size * hidden_size * 3);
+    device_ptr<Tensor2f> tmp_Rh_dev(batch_size * hidden_size * 3);
+    device_ptr<Tensor3f> v_dev(time_steps * batch_size * hidden_size * 4);
 
-        {
-            ScopeTimer t("Train forward:");
-            gru::ForwardPass<float> forward = gru::ForwardPass<float>(
-                true, // training
-                batch_size, input_size, hidden_size, g_blas_handle);
+    h_dev.zero();
 
-            forward.Run(time_steps, W_dev.data, R_dev.data, bx_dev.data, br_dev.data,
-                        x_dev.data, h_dev.data, v_dev.data, tmp_Wx_dev.data,
-                        tmp_Rh_dev.data, 0.0f, nullptr);
-        }
+    {
+        ScopeTimer t("Train forward:");
+        gru::ForwardPass<float> forward = gru::ForwardPass<float>(
+            true,  // training
+            batch_size,
+            input_size,
+            hidden_size,
+            g_blas_handle);
 
-        device_ptr<Tensor3f> dx_dev(time_steps * batch_size *
-                                    input_size); // 输入序列梯度
-        device_ptr<Tensor2f> dW_dev(input_size * hidden_size *
-                                    3); // 对输入权重的梯度
-        device_ptr<Tensor2f> dR_dev(hidden_size * hidden_size *
-                                    3);                // 对循环权重的梯度
-        device_ptr<Tensor1f> dbx_dev(hidden_size * 3); // 对输入偏置的梯度
-        device_ptr<Tensor1f> dbr_dev(hidden_size * 3); // 对循环偏置的梯度
-        device_ptr<Tensor2f> dh_dev(batch_size *
-                                    hidden_size); // 对最后隐藏状态的梯度
-        device_ptr<Tensor3f> dp_dev(time_steps * batch_size * hidden_size *
-                                    3); // 临时缓存梯度（内部结构用）
-        device_ptr<Tensor3f> dq_dev(time_steps * batch_size * hidden_size *
-                                    3); // 临时缓存梯度（内部结构用）
-
-        {
-            ScopeTimer t("Train backward:");
-            gru::BackwardPass<float> backward(batch_size, input_size, hidden_size,
-                                              g_blas_handle);
-
-            backward.Run(time_steps, W_dev.data, R_dev.data, bx_dev.data, br_dev.data,
-                         x_dev.data, h_dev.data, v_dev.data, dh_new_dev.data,
-                         dx_dev.data, dW_dev.data, dR_dev.data, dbx_dev.data,
-                         dbr_dev.data, dh_dev.data, dp_dev.data, dq_dev.data,
-                         nullptr);
-        }
+        forward.Run(
+            time_steps,
+            W_dev.data,
+            R_dev.data,
+            bx_dev.data,
+            br_dev.data,
+            x_dev.data,
+            h_dev.data,
+            v_dev.data,
+            tmp_Wx_dev.data,
+            tmp_Rh_dev.data,
+            0.0f,
+            nullptr);
     }
+
+    device_ptr<Tensor3f> dx_dev(time_steps * batch_size *
+                                input_size); // 输入序列梯度
+    device_ptr<Tensor2f> dW_dev(input_size * hidden_size *
+                                3); // 对输入权重的梯度
+    device_ptr<Tensor2f> dR_dev(hidden_size * hidden_size *
+                                3);                // 对循环权重的梯度
+    device_ptr<Tensor1f> dbx_dev(hidden_size * 3); // 对输入偏置的梯度
+    device_ptr<Tensor1f> dbr_dev(hidden_size * 3); // 对循环偏置的梯度
+    device_ptr<Tensor2f> dh_dev(batch_size *
+                                hidden_size); // 对最后隐藏状态的梯度
+    device_ptr<Tensor3f> dp_dev(time_steps * batch_size * hidden_size *
+                                3); // 临时缓存梯度（内部结构用）
+    device_ptr<Tensor3f> dq_dev(time_steps * batch_size * hidden_size * 3); // 临时缓存梯度（内部结构用）
+
+    {
+        ScopeTimer t("Train backward:");
+        gru::BackwardPass<float> backward(batch_size, input_size, hidden_size,
+                                          g_blas_handle);
+
+        backward.Run(time_steps, W_dev.data, R_dev.data, bx_dev.data, br_dev.data,
+                     x_dev.data, h_dev.data, v_dev.data, dh_new_dev.data,
+                     dx_dev.data, dW_dev.data, dR_dev.data, dbx_dev.data,
+                     dbr_dev.data, dh_dev.data, dp_dev.data, dq_dev.data,
+                     nullptr);
+    }
+
 }
 
 // 计算余弦相似度
@@ -430,6 +440,64 @@ void checkHQuantizationWithCosine(
     }
 }
 
+template<typename QuantT>
+void calibrateGruScales(const Tensor2f &W,
+                        const Tensor2f &R,
+                        const Tensor1f &bx,
+                        const Tensor1f &br,
+                        const Tensor3f &x,
+                        GruQuantScales &gruQuantScales
+) {
+    const int time_steps = x.dimension(2);
+    const int batch_size = x.dimension(1);
+    const int input_size = x.dimension(0);
+    const int hidden_size = R.dimension(1);
+
+    // Copy weights over to GPU.
+    device_ptr<Tensor2f> W_dev(W);
+    device_ptr<Tensor2f> R_dev(R);
+    device_ptr<Tensor1f> bx_dev(bx);
+    device_ptr<Tensor1f> br_dev(br);
+    device_ptr<Tensor3f> x_dev(x);
+//    device_ptr<Tensor3f> dh_new_dev(dh_new);
+
+    device_ptr<Tensor2f> h_dev((time_steps + 1) * batch_size * hidden_size);
+    device_ptr<Tensor3f> tmp_Wx_dev(time_steps * batch_size * hidden_size * 3);
+    device_ptr<Tensor2f> tmp_Rh_dev(batch_size * hidden_size * 3);
+    device_ptr<Tensor3f> v_dev(time_steps * batch_size * hidden_size * 4);
+
+    h_dev.zero();
+
+    gru::ForwardPass<float> forward = gru::ForwardPass<float>(
+        true,  // training
+        batch_size,
+        input_size,
+        hidden_size,
+        g_blas_handle);
+
+    forward.Run(
+        time_steps,
+        W_dev.data,
+        R_dev.data,
+        bx_dev.data,
+        br_dev.data,
+        x_dev.data,
+        h_dev.data,
+        v_dev.data,
+        tmp_Wx_dev.data,
+        tmp_Rh_dev.data,
+        0.0f,
+        nullptr);
+
+    // TODO 校准得到量化参数
+
+    for (int t = 0; t < time_steps; ++t) {
+//        const int wx_size_per_step = batch_size * hidden_size * 3;
+//        const int Rh_size_per_step =;
+    }
+//    GruQuantScales
+}
+
 int main() {
     srand(time(0));
 
@@ -459,7 +527,7 @@ int main() {
     const int input_size = x.dimension(0);
     const int hidden_size = R.dimension(1);
 
-    Tensor3f h_inference((time_steps + 1), batch_size, hidden_size);
+    Tensor3f h_inference(hidden_size, batch_size, (time_steps + 1));
     h_inference.setRandom();
     GruInference(W, R, bx, br, x, h_inference);
 
@@ -470,6 +538,9 @@ int main() {
     printf("cudaError(GruTrain finish): %s\n", cudaGetErrorString(cudaGetLastError()));
 
     // Quant
+
+
+
     Tensor2i8 W_quant(HIDDEN_DIMS * 3, INPUT_DIMS);  // 对应W_z/W_r/W_h的合并
     Tensor2i8 R_quant(HIDDEN_DIMS * 3, HIDDEN_DIMS); // 对应R_z/R_r/R_h的合并
     Tensor1i32 bx_quant(HIDDEN_DIMS * 3); // 对应b_z/b_r/b_h的合并. bx 负责给 “输入 x_t 到门控的线性变换” 加偏置
@@ -494,7 +565,7 @@ int main() {
                         gruQuantScales,
                         rescaleParams);
 
-    Tensor3i8 h_quant_inference((time_steps + 1), batch_size, hidden_size);
+    Tensor3i8 h_quant_inference(hidden_size, batch_size, (time_steps + 1));
     {
         // N : batch_size
         // C : input_size
@@ -527,6 +598,7 @@ int main() {
         std::vector<float> h_inference_tmp(h_inference.data(), h_inference.data() + h_inference.size());
         std::vector<int8_t> h_quant_inference_tmp(h_quant_inference.data(),
                                                   h_quant_inference.data() + h_quant_inference.size());
+
         checkHQuantizationWithCosine(h_inference_tmp,
                                      h_quant_inference_tmp,
                                      time_steps,

@@ -1,6 +1,7 @@
 #include <thrust/extrema.h>
 #include <thrust/copy.h>
 #include <thrust/reduce.h>
+#include <thrust/count.h>
 #include <thrust/device_ptr.h>
 #include <limits>
 #include <algorithm>
@@ -311,6 +312,7 @@ inline ScaleParam computeRescaleParamFixedShift(float src_scale, float dst_scale
     return param;
 }
 
+
 /**
  * @brief 计算量化参数（对称或非对称）
  * @tparam QuantT   目标量化类型（如 int8_t 或 int16_t）
@@ -320,28 +322,19 @@ inline ScaleParam computeRescaleParamFixedShift(float src_scale, float dst_scale
  * @return QuantParams 量化参数结构体
  */
 template<typename QuantT>
-QuantParams calculateQuantParams(
+inline QuantParams calculateQuantParams(
     const float *data,
     size_t size,
     bool symmetric) {
 
-    QuantParams params;
-
     if (data == nullptr || size == 0) {
+        QuantParams params;
         params.scale = 1.0f;
         params.zero_point = 0;
         return params;
     }
 
-    // -----------------------------
-    // 1. 获取目标类型范围
-    // -----------------------------
-    const int32_t int_min = static_cast<int32_t>(std::numeric_limits<QuantT>::min());
-    const int32_t int_max = static_cast<int32_t>(std::numeric_limits<QuantT>::max());
-
-    // -----------------------------
-    // 2. 并行找出最大最小值
-    // -----------------------------
+    // 并行找出最大最小值
     float max_val = data[0];
     float min_val = data[0];
 
@@ -352,23 +345,7 @@ QuantParams calculateQuantParams(
         if (v < min_val) min_val = v;
     }
 
-    // -----------------------------
-    // 3. 根据模式计算 scale 和 zero_point
-    // -----------------------------
-    if (symmetric) {
-        // 对称量化：zero_point = 0
-        float abs_max = std::max(std::abs(max_val), std::abs(min_val));
-        params.scale = abs_max / static_cast<float>(int_max);
-        params.zero_point = 0;
-    } else {
-        // 非对称量化：线性映射 [min_val, max_val] → [int_min, int_max]
-        params.scale = (max_val - min_val) / static_cast<float>(int_max - int_min);
-        if (params.scale < 1e-12f) params.scale = 1e-12f; // 避免除0
-        params.zero_point = static_cast<int32_t>(std::round(int_min - min_val / params.scale));
-        params.zero_point = std::clamp(params.zero_point, int_min, int_max);
-    }
-
-    return params;
+    return calculateQuantParams<QuantT>(max_val, min_val, symmetric);
 }
 
 template QuantParams calculateQuantParams<int8_t>(
@@ -579,28 +556,18 @@ void computeGruRescaleParamsPerStep(
 
         // 计算 r_to_Wx_g 的 rescale 参数
         // 用于计算 r * (Rh_aligned_g + br_aligned_g)
-        // r 输出的 scale 是 S_r = 1.0f / 255.0f（sigmoid 输出）
+        // r 输出的 scale 是 S_r = 1.0f / 127.0f（sigmoid LUT 输出范围是 [0, 127]）
         // (Rh_aligned_g + br_aligned_g) 的 scale 是 S_Wx_g（已经对齐到 Wx_g）
         // r * (Rh_aligned_g + br_aligned_g) 的 scale 是 S_r * S_Wx_g
-        // 需要 rescale 到 S_Wx_g，所以需要除以 S_r，即乘以 1/S_r = 255.0f
-        // 但是，由于我们需要将 r 的 scale 对齐到 Wx_g，所以参数应该是 (S_r / S_Wx_g) * (1 << shift)
-        // 但这样计算出来的结果 scale 是 S_r^2，不正确
-        // 正确的做法是：r_to_Wx_g 应该表示将 (r * value) 的结果 rescale 到 Wx_g
-        // 即：如果 value 的 scale 是 S_Wx_g，那么 r * value 的 scale 是 S_r * S_Wx_g
-        // 需要 rescale 到 S_Wx_g，所以需要乘以 1/S_r = 255.0f
-        // 因此，r_to_Wx_g 的参数应该是 (1.0f / S_r) / S_Wx_g * (1 << shift) = 255.0f / S_Wx_g * (1 << shift)
-        float r_output_scale = gruQuantScales.r.scale; // 1.0f / 255.0f
+        // 需要 rescale 到 S_Wx_g，所以需要除以 S_r，即乘以 1/S_r = 127.0f
+        // 因此，r_to_Wx_g 的参数应该是将 scale (S_r * S_Wx_g) rescale 到 S_Wx_g
+        float r_output_scale = gruQuantScales.r.scale; // 1.0f / 127.0f（根据 initLut，sigmoid 输出范围是 [0, 127]）
+        // wx_scale_g 已经在上面计算过（第521行）
         // 计算将 (r * value_with_scale_Wx_g) 的结果 rescale 到 Wx_g 的参数
         // 即：将 scale (S_r * S_Wx_g) rescale 到 S_Wx_g，需要乘以 1/S_r
-        float scale_ratio = 1.0f / r_output_scale; // 255.0f
-        double multiplier = static_cast<double>(scale_ratio) * (1LL << fixed_shift);
-        int64_t multiplier_long = static_cast<int64_t>(std::round(multiplier));
-        if (multiplier_long > std::numeric_limits<int32_t>::max())
-            multiplier_long = std::numeric_limits<int32_t>::max();
-        if (multiplier_long < std::numeric_limits<int32_t>::min())
-            multiplier_long = std::numeric_limits<int32_t>::min();
-        params.r_to_Wx_g.M = static_cast<int32_t>(multiplier_long);
-        params.r_to_Wx_g.shift = fixed_shift;
+        ScaleParam r_to_wx_g = computeRescaleParamFixedShift(r_output_scale * wx_scale_g, wx_scale_g, fixed_shift);
+        params.r_to_Wx_g.M = r_to_wx_g.M;
+        params.r_to_Wx_g.shift = r_to_wx_g.shift;
     }
 
 }
@@ -660,19 +627,54 @@ template void calculateScaleZeroPointFromDevice<int16_t>(
 
 template<typename T>
 T findMaxValueFromDev(const T *dev_data, size_t size) {
-//    const auto max_it = thrust::max_element(thrust::device, dev_data, dev_data + size);
-//
-//    T max_val;
-//    thrust::copy(max_it, max_it + 1, &max_val);
-//
-//    return max_val;
-//    thrust::device_ptr<const T> dev_ptr(dev_data);
-    return thrust::reduce(thrust::device, dev_data, dev_data + size,
-                          std::numeric_limits<T>::lowest(),
-                          thrust::maximum<T>());
+    if (size == 0) {
+        // 边界处理：空数据返回最小值（避免访问非法内存）
+        return std::numeric_limits<T>::lowest();
+    }
 
+    // 直接用 thrust::max_element 找设备端最大值的迭代器
+    const T *max_it = thrust::max_element(thrust::device, dev_data, dev_data + size);
+
+    T max_val;
+    // 把设备端的最大值拷贝到主机端
+    thrust::copy(thrust::device, max_it, max_it + 1, &max_val);
+
+    return max_val;
+
+//    return thrust::reduce(thrust::device, dev_data, dev_data + size,
+//                          std::numeric_limits<T>::lowest(),
+//                          thrust::maximum<T>());
 }
 
 template int8_t findMaxValueFromDev<int8_t>(const int8_t *dev_data, size_t size);
 
 template int16_t findMaxValueFromDev<int16_t>(const int16_t *dev_data, size_t size);
+
+template float findMaxValueFromDev<float>(const float *dev_data, size_t size);
+
+template<typename T>
+T findMinValueFromDev(const T *dev_data, size_t size) {
+    if (size == 0) {
+        // 边界处理：空数据返回最大值（避免访问非法内存）
+        return std::numeric_limits<T>::max();
+    }
+
+    // 直接用 thrust::max_element 找设备端最大值的迭代器
+    const T *min_it = thrust::min_element(thrust::device, dev_data, dev_data + size);
+
+    T min_val;
+    // 把设备端的最大值拷贝到主机端
+    thrust::copy(thrust::device, min_it, min_it + 1, &min_val);
+
+    return min_val;
+
+//    return thrust::reduce(thrust::device, dev_data, dev_data + size,
+//                          std::numeric_limits<T>::lowest(),
+//                          thrust::maximum<T>());
+}
+
+template int8_t findMinValueFromDev<int8_t>(const int8_t *dev_data, size_t size);
+
+template int16_t findMinValueFromDev<int16_t>(const int16_t *dev_data, size_t size);
+
+template float findMinValueFromDev<float>(const float *dev_data, size_t size);
