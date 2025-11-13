@@ -29,6 +29,7 @@ class ForwardPass {
   // hidden_size: the expected dimension of each output vector.
   // blas_handle: an initialized cuBLAS handle (see `cublasCreate`).
   ForwardPass(
+      const bool calibration,
       const bool training,
       const int batch_size,
       const int input_size,

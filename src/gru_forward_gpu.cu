@@ -9,7 +9,7 @@
 
 namespace {
 
-template<typename T, bool Training, bool ApplyZoneout>
+template<typename T, bool Training, bool ApplyZoneout, bool Calibration = false>
 __global__
 void PointwiseOperations(const int batch_dim,
                          const int hidden_dim,
@@ -21,9 +21,14 @@ void PointwiseOperations(const int batch_dim,
                          T *h_out,
                          T *v,
                          const T zoneout_prob,
-                         const T *zoneout_mask) {  // Zoneout mask (only used if ApplyZoneout==true)
-    const int row = blockDim.x * blockIdx.x + threadIdx.x;
-    const int col = blockDim.y * blockIdx.y + threadIdx.y;
+                         const T *zoneout_mask
+//                         ,
+//                         T *z_pres,
+//                         T *r_pres,
+//                         T *g_pres
+) {  // Zoneout mask (only used if ApplyZoneout==true)
+    const int row = blockDim.x * blockIdx.x + threadIdx.x; // 当前线程对应的隐藏单元
+    const int col = blockDim.y * blockIdx.y + threadIdx.y; // 当前线程对应的batch样本
 
     if (row >= hidden_dim || col >= batch_dim)
         return;
@@ -43,9 +48,18 @@ void PointwiseOperations(const int batch_dim,
     const int br_idx = row + 1 * hidden_dim;
     const int bg_idx = row + 2 * hidden_dim;
 
-    const T z = sigmoid(Wx[z_idx] + Rh[z_idx] + bx[bz_idx] + br[bz_idx]);
-    const T r = sigmoid(Wx[r_idx] + Rh[r_idx] + bx[br_idx] + br[br_idx]);
-    const T g = tanh(Wx[g_idx] + r * (Rh[g_idx] + br[bg_idx]) + bx[bg_idx]);
+    const T z_pre = Wx[z_idx] + Rh[z_idx] + bx[bz_idx] + br[bz_idx];
+    const T z = sigmoid(z_pre);
+
+    const T r_pre = Wx[r_idx] + Rh[r_idx] + bx[br_idx] + br[br_idx];
+    const T r = sigmoid(r_pre);
+
+    const T g_pre = Wx[g_idx] + r * (Rh[g_idx] + br[bg_idx]) + bx[bg_idx];
+    const T g = tanh(g_pre);
+
+    if (Calibration) {
+//        z_pres;
+    }
 
     // Store internal activations if we're eventually going to backprop.
     if (Training) {
@@ -71,7 +85,7 @@ void PointwiseOperations(const int batch_dim,
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
 
-template<typename T, bool Training, bool ApplyZoneout>
+template<typename T, bool Training, bool ApplyZoneout, bool Calibration = false>
 __global__
 void PointwiseOperations(const int batch_dim,
                          const int hidden_dim,
@@ -95,6 +109,7 @@ namespace gru {
 
 template<typename T>
 struct ForwardPass<T>::private_data {
+  bool calibration;
   bool training;
   int batch_size;
   int input_size;
@@ -107,12 +122,14 @@ struct ForwardPass<T>::private_data {
 
 template<typename T>
 ForwardPass<T>::ForwardPass(
+    const bool calibration,
     const bool training,
     const int batch_size,
     const int input_size,
     const int hidden_size,
     const cublasHandle_t &blas_handle,
     const cudaStream_t &stream) : data_(new private_data) {
+    data_->calibration = calibration;
     data_->training = training;
     data_->batch_size = batch_size;
     data_->input_size = input_size;
@@ -339,6 +356,7 @@ void ForwardPass<T>::Run(
 
     const int NH = batch_size * hidden_size;
     for (int i = 0; i < steps; ++i) {
+        const int Rh_offset = data_->calibration ? i * NH * 3 : 0;
         IterateInternal(
             R,
             bx,
@@ -347,7 +365,7 @@ void ForwardPass<T>::Run(
             h + (i + 1) * NH,
             v + i * NH * 4,
             tmp_Wx + i * NH * 3,
-            tmp_Rh,
+            tmp_Rh + Rh_offset,
             zoneout_prob,
             zoneout_mask ? zoneout_mask + i * NH : nullptr);
     }
