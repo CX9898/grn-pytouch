@@ -325,7 +325,6 @@ template<typename T>
 void ForwardPassQuant<T>::IterateInternal(
     // C = input_size(输入维度), H = hidden_size(隐藏层维度),
     // T = time_steps(时间步), N = batch_size(批量大小)
-    int step_idx,
     const T *R,   // [H,H*3]
     const int32_t *bx,  // [H*3]
     const int32_t *br,  // [H*3]
@@ -385,50 +384,38 @@ void ForwardPassQuant<T>::IterateInternal(
 
 template<typename T>
 void ForwardPassQuant<T>::setRescaleParam(const QuantGRUScales &quantGruScales) {
-    const int steps = quantGruScales.steps;
     const int hidden = quantGruScales.hidden;
-    const int size = steps * hidden;
-    std::vector<ScaleParam> Rh_z_to_Wx_z(size);
-    std::vector<ScaleParam> Rh_r_to_Wx_r(size);
-    std::vector<ScaleParam> rRh_g_to_Wx_g(size);
-    std::vector<ScaleParam> Wx_to_z_pre(size);
-    std::vector<ScaleParam> Wx_to_r_pre(size);
-    std::vector<ScaleParam> Wx_to_g_pre(size);
-    std::vector<ScaleParam> zh_in_to_h_out(size);
-    std::vector<ScaleParam> zg_to_h_out(size);
+    std::vector<ScaleParam> Rh_z_to_Wx_z(hidden);
+    std::vector<ScaleParam> Rh_r_to_Wx_r(hidden);
+    std::vector<ScaleParam> rRh_g_to_Wx_g(hidden);
+    std::vector<ScaleParam> Wx_to_z_pre(hidden);
+    std::vector<ScaleParam> Wx_to_r_pre(hidden);
+    std::vector<ScaleParam> Wx_to_g_pre(hidden);
+    std::vector<ScaleParam> zh_in_to_h_out(hidden);
+    std::vector<ScaleParam> zg_to_h_out(hidden);
 
-    for (int t = 0; t < steps; ++t) {
-        const float h_in = quantGruScales.h[t];
-        const float h_out = quantGruScales.h[t + 1];
+    for (int idx = 0; idx < hidden; ++idx) { // per-channel
+        const float Wx = quantGruScales.Wx[idx];
+        const float Rh = quantGruScales.Rh[idx];
 
-        for (int hidden_idx = 0; hidden_idx < hidden; ++hidden_idx) {
-            const int idx = t * hidden + hidden_idx;
-            const float Wx_z = quantGruScales.Wx_z[idx];
-            const float Wx_r = quantGruScales.Wx_r[idx];
-            const float Wx_g = quantGruScales.Wx_g[idx];
+        const float z_pre = quantGruScales.z_pre[idx];
+        const float r_pre = quantGruScales.r_pre[idx];
+        const float g_pre = quantGruScales.g_pre[idx];
 
-            const float Rh_z = quantGruScales.Rh_z[idx];
-            const float Rh_r = quantGruScales.Rh_r[idx];
-            const float Rh_g = quantGruScales.Rh_g[idx];
+        const float z_out = quantGruScales.z_out[idx];
+        const float r_out = quantGruScales.r_out[idx];
+        const float g_out = quantGruScales.g_out[idx];
 
-            const float z_pre = quantGruScales.z_pre[idx];
-            const float r_pre = quantGruScales.r_pre[idx];
-            const float g_pre = quantGruScales.g_pre[idx];
-
-            const float z_out = quantGruScales.z_out[idx];
-            const float r_out = quantGruScales.r_out[idx];
-            const float g_out = quantGruScales.g_out[idx];
-
-            Rh_z_to_Wx_z[idx] = computeRescaleParam(Rh_z, Wx_z);
-            Rh_r_to_Wx_r[idx] = computeRescaleParam(Rh_r, Wx_r);
-            rRh_g_to_Wx_g[idx] = computeRescaleParam(r_out * Rh_g, Wx_g);
-            Wx_to_z_pre[idx] = computeRescaleParam(Wx_z, z_pre);
-            Wx_to_r_pre[idx] = computeRescaleParam(Wx_r, r_pre);
-            Wx_to_g_pre[idx] = computeRescaleParam(Wx_g, g_pre);
-            zh_in_to_h_out[idx] = computeRescaleParam(z_out * h_in, h_out);
-            zg_to_h_out[idx] = computeRescaleParam(z_out * g_out, h_out);
-        }
+        // Rh_z_to_Wx_z[idx] = computeRescaleParam(Rh_z, Wx_z);
+        // Rh_r_to_Wx_r[idx] = computeRescaleParam(Rh_r, Wx_r);
+        // rRh_g_to_Wx_g[idx] = computeRescaleParam(r_out * Rh_g, Wx_g);
+        // Wx_to_z_pre[idx] = computeRescaleParam(Wx_z, z_pre);
+        // Wx_to_r_pre[idx] = computeRescaleParam(Wx_r, r_pre);
+        // Wx_to_g_pre[idx] = computeRescaleParam(Wx_g, g_pre);
+        // zh_in_to_h_out[idx] = computeRescaleParam(z_out * h_in, h_out);
+        // zg_to_h_out[idx] = computeRescaleParam(z_out * g_out, h_out);
     }
+
 
     h2d(rescale_param_.Rh_z_to_Wx_z, Rh_z_to_Wx_z);
     h2d(rescale_param_.Rh_r_to_Wx_r, Rh_r_to_Wx_r);
@@ -486,7 +473,9 @@ void ForwardPassQuant<T>::Run(const int steps, // 时间步数, 序列长度T
         }
     }
 
-    // gemm后补偿x_zp
+    // TODO: Rh的gemm需要补偿h_zp, 所以提前计算 h_zp * R_sum, stream1
+
+    // TODO: Wx的gemm后补偿x_zp
     dev::vector<int32_t> w_sum(1);
     computeWeightSum(W, w_sum.data(), hidden_size * 3, input_size, stream2);
 //    dev::vector<int32_t> x_zp(gruQuantScales_.x_zp);
@@ -509,7 +498,7 @@ void ForwardPassQuant<T>::Run(const int steps, // 时间步数, 序列长度T
 //        gruQuantScales_.Rh[i] = combineRWithH(gruQuantScales_.R, gruQuantScales_.h[i]);
 //        rescaleParam_[i].Rh_to_Wx = alignRhToWxShift(gruQuantScales_.Rh[i], gruQuantScales_.Wx[i]);
 
-        IterateInternal(i, R, bx, br, h + i * NH, h + (i + 1) * NH, v + i * NH * 4,
+        IterateInternal(R, bx, br, h + i * NH, h + (i + 1) * NH, v + i * NH * 4,
                         tmp_Wx + i * NH * 3, tmp_Rh, zoneout_prob,
                         zoneout_mask ? zoneout_mask + i * NH : nullptr);
 

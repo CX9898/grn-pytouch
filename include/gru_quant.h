@@ -87,7 +87,6 @@ class ForwardPassQuant {
 
  private:
   void IterateInternal(
-      int step_idx,
       const T *R,
       const int32_t *bx,
       const int32_t *br,

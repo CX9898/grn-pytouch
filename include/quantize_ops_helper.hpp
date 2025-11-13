@@ -26,17 +26,19 @@ struct ScaleParam3 { // 对应三个门: z, r, g
 };
 
 struct GRUQuantScale {
-  std::vector<float> Wx_scale; // size = time_steps * hidden * 3
-  std::vector<float> Rh_scale; // size = time_steps * hidden * 3
-  std::vector<float> z_pre; // size = time_steps * hidden
-  std::vector<float> r_pre; // size = time_steps * hidden
-  std::vector<float> g_pre; // size = time_steps * hidden
-  std::vector<float> z_out; // size = time_steps * hidden
-  std::vector<float> r_out; // size = time_steps * hidden
-  std::vector<float> g_out; // size = time_steps * hidden
+  std::vector<float> Wx_scale; // size = hidden * 3
+  std::vector<float> Rh_scale; // size = hidden * 3
+
+  std::vector<float> z_pre; // size = hidden
+  std::vector<float> r_pre; // size = hidden
+  std::vector<float> g_pre; // size = hidden
+
+  std::vector<float> z_out; // size = hidden
+  std::vector<float> r_out; // size = hidden
+  std::vector<float> g_out; // size = hidden
 };
 
-struct QuantGRUReScale { // size = time_steps * hidden
+struct QuantGRUReScale { // size = hidden
   dev::vector<ScaleParam> Rh_z_to_Wx_z;
   dev::vector<ScaleParam> Rh_r_to_Wx_r;
   dev::vector<ScaleParam> rRh_g_to_Wx_g;
@@ -47,23 +49,48 @@ struct QuantGRUReScale { // size = time_steps * hidden
   dev::vector<ScaleParam> zg_to_h_out;
 };
 
-struct QuantGRUScales {
-  int steps;
+struct QuantGRUMinMax {
   int hidden;
-  std::vector<float> x; // size = steps
-  std::vector<float> h; // size = steps + 1
-  std::vector<float> Wx_z; // size = steps * hidden
-  std::vector<float> Wx_r; // size = steps * hidden
-  std::vector<float> Wx_g; // size = steps * hidden
-  std::vector<float> Rh_z; // size = (steps + 1) * hidden
-  std::vector<float> Rh_r; // size = (steps + 1) * hidden
-  std::vector<float> Rh_g; // size = (steps + 1) * hidden
-  std::vector<float> z_pre; // size = steps * hidden
-  std::vector<float> r_pre; // size = steps * hidden
-  std::vector<float> g_pre; // size = steps * hidden
-  std::vector<float> z_out; // size = steps * hidden
-  std::vector<float> r_out; // size = steps * hidden
-  std::vector<float> g_out; // size = steps * hidden
+  float x;
+  float h;
+  float bx;
+  float br;
+  std::vector<float> Wx; // size = hidden. per-channel
+  std::vector<float> Rh; // size = hidden
+
+  std::vector<float> Wx_add_bx; // size = hidden
+  std::vector<float> Rh_add_br; // size = hidden
+
+  std::vector<float> z_pre; // size = hidden
+  std::vector<float> r_pre; // size = hidden
+  std::vector<float> g_pre; // size = hidden
+
+  std::vector<float> z_out; // size = hidden
+  std::vector<float> r_out; // size = hidden
+  std::vector<float> g_out; // size = hidden
+};
+
+struct QuantGRUScales {
+  int hidden;
+  float x;
+  int32_t x_zp;
+  float h;
+  int32_t h_zp;
+  float bx;
+  float br;
+  std::vector<float> Wx; // size = hidden. per-channel
+  std::vector<float> Rh; // size = hidden
+
+  std::vector<float> Wx_add_bx; // size = hidden
+  std::vector<float> Rh_add_br; // size = hidden
+
+  std::vector<float> z_pre; // size = hidden
+  std::vector<float> r_pre; // size = hidden
+  std::vector<float> g_pre; // size = hidden
+
+  std::vector<float> z_out; // size = hidden
+  std::vector<float> r_out; // size = hidden
+  std::vector<float> g_out; // size = hidden
 };
 
 
@@ -128,6 +155,8 @@ inline ScaleParam3 combineScaleParam3(const ScaleParam3 &a, const ScaleParam &b)
     }
     return result;
 }
+
+
 
 
 template<typename T>

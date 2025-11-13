@@ -72,8 +72,7 @@ void GruQuantInit(
     Tensor1i32 &br_quant,
     Tensor3i8 &x_quant,
     Tensor3i8 &dh_new_quant,
-    GruQuantScales &gruQuantScales,
-    std::vector<RescaleParamsPerStep> &gruRescaleParams
+    const QuantGRUScales &gruRescaleParams
 ) {
     const int time_steps = x.dimension(2);
     const int batch_size = x.dimension(1);
@@ -83,116 +82,7 @@ void GruQuantInit(
     // N : batch_size
     // C : input_size
     if (!use_int16) { // int8量化
-        gruQuantScales = computeGruQuantParams<int8_t>(
-            x.data(), time_steps, batch_size, input_size, W.data(), hidden_size,
-            R.data(), bx.data(), br.data());
 
-        computeGruRescaleParamsPerStep(time_steps, gruQuantScales, gruRescaleParams, 15);
-
-        // Copy weights over to GPU.
-        device_ptr<Tensor2f> W_tmp_dev(W);
-        device_ptr<Tensor2f> R_tmp_dev(R);
-        device_ptr<Tensor1f> bx_tmp_dev(bx);
-        device_ptr<Tensor1f> br_tmp_dev(br);
-        device_ptr<Tensor3f> x_tmp_dev(x);
-        device_ptr<Tensor3f> dh_new_tmp_dev(dh_new);
-
-        device_ptr<Tensor2i8> W_dev(W.size());
-        device_ptr<Tensor2i8> R_dev(R.size());
-        device_ptr<Tensor1i32> bx_dev(bx.size());
-        device_ptr<Tensor1i32> br_dev(br.size());
-        device_ptr<Tensor3i8> x_dev(x.size());
-        device_ptr<Tensor3i8> dh_new_dev(dh_new.size());
-
-        // -----------------------------
-        // 3. 量化 W
-        // -----------------------------
-        quantizeFloatToInt<int8_t, true, true>(
-            W_tmp_dev.data, W_dev.data, HIDDEN_DIMS * INPUT_DIMS,
-            1.0f / gruQuantScales.W.gate[0].scale);
-
-        quantizeFloatToInt<int8_t, true, true>(
-            W_tmp_dev.data + HIDDEN_DIMS * INPUT_DIMS,
-            W_dev.data + HIDDEN_DIMS * INPUT_DIMS, HIDDEN_DIMS * INPUT_DIMS,
-            1.0f / gruQuantScales.W.gate[1].scale);
-
-        quantizeFloatToInt<int8_t, true, true>(
-            W_tmp_dev.data + 2 * HIDDEN_DIMS * INPUT_DIMS,
-            W_dev.data + 2 * HIDDEN_DIMS * INPUT_DIMS, HIDDEN_DIMS * INPUT_DIMS,
-            1.0f / gruQuantScales.W.gate[2].scale);
-
-        // -----------------------------
-        // 4. 量化 R
-        // -----------------------------
-        quantizeFloatToInt<int8_t, true, true>(
-            R_tmp_dev.data, R_dev.data, HIDDEN_DIMS * HIDDEN_DIMS,
-            1.0f / gruQuantScales.R.gate[0].scale);
-
-        quantizeFloatToInt<int8_t, true, true>(
-            R_tmp_dev.data + HIDDEN_DIMS * HIDDEN_DIMS,
-            R_dev.data + HIDDEN_DIMS * HIDDEN_DIMS, HIDDEN_DIMS * HIDDEN_DIMS,
-            1.0f / gruQuantScales.R.gate[1].scale);
-
-        quantizeFloatToInt<int8_t, true, true>(
-            R_tmp_dev.data + 2 * HIDDEN_DIMS * HIDDEN_DIMS,
-            R_dev.data + 2 * HIDDEN_DIMS * HIDDEN_DIMS, HIDDEN_DIMS * HIDDEN_DIMS,
-            1.0f / gruQuantScales.R.gate[2].scale);
-
-        // -----------------------------
-        // 5. 量化 bx
-        // -----------------------------
-        quantizeFloatToInt<int32_t, true, true, false>(
-            bx_tmp_dev.data, bx_dev.data, HIDDEN_DIMS,
-            1.0f / gruQuantScales.bx.gate[0].scale);
-
-        quantizeFloatToInt<int32_t, true, true, false>(
-            bx_tmp_dev.data + HIDDEN_DIMS, bx_dev.data + HIDDEN_DIMS, HIDDEN_DIMS,
-            1.0f / gruQuantScales.bx.gate[1].scale);
-
-        quantizeFloatToInt<int32_t, true, true, false>(
-            bx_tmp_dev.data + 2 * HIDDEN_DIMS, bx_dev.data + 2 * HIDDEN_DIMS,
-            HIDDEN_DIMS, 1.0f / gruQuantScales.bx.gate[2].scale);
-
-        // -----------------------------
-        // 6. 量化 br
-        // -----------------------------
-        quantizeFloatToInt<int32_t, true, true, false>(
-            br_tmp_dev.data, br_dev.data, HIDDEN_DIMS,
-            1.0f / gruQuantScales.br.gate[0].scale);
-
-        quantizeFloatToInt<int32_t, true, true, false>(
-            br_tmp_dev.data + HIDDEN_DIMS, br_dev.data + HIDDEN_DIMS, HIDDEN_DIMS,
-            1.0f / gruQuantScales.br.gate[1].scale);
-
-        quantizeFloatToInt<int32_t, true, true, false>(
-            br_tmp_dev.data + 2 * HIDDEN_DIMS, br_dev.data + 2 * HIDDEN_DIMS,
-            HIDDEN_DIMS, 1.0f / gruQuantScales.br.gate[2].scale);
-
-        // -----------------------------
-        // 7. 量化 x. 分时间步不同
-        // -----------------------------
-        dev::vector<float> x_scale_dev(gruQuantScales.x_scale);
-        dev::vector<int32_t> x_zp_dev(gruQuantScales.x_zp);
-        quantizeFloatToIntPerStep<int8_t, false, false>(
-            x_tmp_dev.data, x_dev.data, x_tmp_dev.size, x_scale_dev.data(),
-            x_zp_dev.data(), time_steps);
-
-        // -----------------------------
-        // 8. 量化 dh_new
-        // -----------------------------
-        //            quantizeFloatToInt<int8_t, true, true>(
-        //                dh_new_tmp_dev.data,
-        //                dh_new_dev.data,
-        //                dh_new_tmp_dev.size,
-        //                1.0f / gruQuantScales.x.scale
-        //            );
-
-        W_dev.ToHost(W_quant);
-        R_dev.ToHost(R_quant);
-        bx_dev.ToHost(bx_quant);
-        br_dev.ToHost(br_quant);
-        x_dev.ToHost(x_quant);
-        dh_new_dev.ToHost(dh_new_quant);
 
     } else {
         // int16量化
@@ -386,7 +276,7 @@ void checkHQuantizationWithCosine(
     int time_steps,
     int batch_size,
     int hidden_size,
-    const std::vector<ScaleParam> &scaleParam,                  // 每步 scale M, 每步 shift
+    const QuantGRUScales &scaleParam,                  // 每步 scale M, 每步 shift
     float threshold = 1.0f                          // 超阈值
 ) {
 
@@ -406,12 +296,11 @@ void checkHQuantizationWithCosine(
                   h_inference.begin() + (t + 1) * size_per_step,
                   h_float_step.begin());
 
-        // 反量化
-        dequantizeTensorFixedPoint(h_quant_inference.data() + t * size_per_step,
-                                   size_per_step,
-                                   scaleParam[t].M,
-                                   scaleParam[t].shift,
-                                   h_quant_step.data());
+        // TODO: 反量化
+//        dequantizeTensorFixedPoint(h_quant_inference.data() + t * size_per_step,
+//                                   size_per_step,
+//                                   scaleParam.h,
+//                                   h_quant_step.data());
 
         // 差值统计
         float max_diff = 0.0f;
@@ -492,12 +381,7 @@ void calibrateGruScales(const Tensor2f &W,
         nullptr);
 
     // TODO 校准得到量化参数
-
-    for (int t = 0; t < time_steps; ++t) {
-//        const int wx_size_per_step = batch_size * hidden_size * 3;
-//        const int Rh_size_per_step =;
-    }
-//    GruQuantScales
+    // quant_gru_scales
 }
 
 int main() {
@@ -529,20 +413,17 @@ int main() {
     const int input_size = x.dimension(0);
     const int hidden_size = R.dimension(1);
 
+    // 运行浮点GRU得到结果1
     Tensor3f h_inference(hidden_size, batch_size, (time_steps + 1));
-    h_inference.setRandom();
+    h_inference.setZero();
     GruInference(W, R, bx, br, x, h_inference);
 
     printf("cudaError(GruInference finish): %s\n", cudaGetErrorString(cudaGetLastError()));
 
-    GruTrain(W, R, bx, br, x, dh, false, false);
-
-    printf("cudaError(GruTrain finish): %s\n", cudaGetErrorString(cudaGetLastError()));
+    QuantGRUScales quant_gru_scales;
+    calibrateGruScales<int8_t>(W, R, bx, br, x, quant_gru_scales); // TODO: 效验得到固定量化参数
 
     // Quant
-
-
-
     Tensor2i8 W_quant(HIDDEN_DIMS * 3, INPUT_DIMS);  // 对应W_z/W_r/W_h的合并
     Tensor2i8 R_quant(HIDDEN_DIMS * 3, HIDDEN_DIMS); // 对应R_z/R_r/R_h的合并
     Tensor1i32 bx_quant(HIDDEN_DIMS * 3); // 对应b_z/b_r/b_h的合并. bx 负责给 “输入 x_t 到门控的线性变换” 加偏置
@@ -550,8 +431,7 @@ int main() {
     Tensor3i8 x_quant(INPUT_DIMS, BATCH_SIZE, SEQUENCE_LEN);
     Tensor3i8 dh_new_quant(HIDDEN_DIMS, BATCH_SIZE, SEQUENCE_LEN + 1);
 
-    GruQuantScales gruQuantScales;
-    std::vector<RescaleParamsPerStep> rescaleParams(SEQUENCE_LEN);
+    // TODO: 使用固定量化参数将输入量化
     GruQuantInit<false>(W,
                         R,
                         bx,
@@ -564,33 +444,14 @@ int main() {
                         br_quant,
                         x_quant,
                         dh_new_quant,
-                        gruQuantScales,
-                        rescaleParams);
+                        quant_gru_scales);
 
+    // TODO: 得到量化GRU中使用的rescale参数
+
+
+    // 运行量化GRU得到量化结果2
     Tensor3i8 h_quant_inference(hidden_size, batch_size, (time_steps + 1));
-    {
-        // N : batch_size
-        // C : input_size
-        QuantParams h_0_quantParams = calculateQuantParams<int8_t>(h_inference.data(),
-                                                                   batch_size * hidden_size);
-        gruQuantScales.h_scale[0] = h_0_quantParams.scale;
-
-        device_ptr<Tensor3f> h_dev(h_inference);
-        device_ptr<Tensor3i8> h_quant_dev((time_steps + 1) * batch_size * hidden_size);
-        quantizeFloatToInt<int8_t, true, true>(
-            h_dev.data, h_quant_dev.data, batch_size * hidden_size,
-            1.0f / gruQuantScales.h_scale[0]);
-        h_quant_dev.ToHost(h_quant_inference);
-    }
-
-    GruQuantScalesFixed gruQuantScalesFixed;
-    gruQuantScalesFixed.initialize(gruQuantScales);
-    gruQuantScalesFixed.h[0] = floatScaleToFixed(gruQuantScales.h_scale[0]);
-
-    QuantGRUScales quant_gru_scales;
-
-    calibrateGruScales<int8_t>(W, R, bx, br, x, quant_gru_scales);
-
+    h_quant_inference.setZero();
     GruInferenceQuant(W_quant,
                       R_quant,
                       bx_quant,
@@ -609,10 +470,15 @@ int main() {
                                      time_steps,
                                      batch_size,
                                      hidden_size,
-                                     gruQuantScalesFixed.h);
+                                     quant_gru_scales);
     }
 
     printf("cudaError(GruInferenceQuant finish): %s\n", cudaGetErrorString(cudaGetLastError()));
+
+
+    GruTrain(W, R, bx, br, x, dh, false, false);
+
+    printf("cudaError(GruTrain finish): %s\n", cudaGetErrorString(cudaGetLastError()));
 
     cublasDestroy(g_blas_handle);
 
