@@ -295,12 +295,12 @@ __device__ __forceinline__ int8_t tanh_int16_lut(int16_t x, const int8_t* lut) {
 > - Rh 和 br 是设置为同一个scale吗? Wx 和 bx 是设置为同一个scale吗?
 > - 对称和非对称量化的选择:
 >   - x: 非对称
->   - h: 
+>   - h: 非对称
 >   - W: 对称
 >   - R: 对称
->   - z:
->   - r:
->   - g:
+>   - z: 非对称
+>   - r: 非对称
+>   - g: 对称
 > - 门控量化计算检查
 
 ## GruTrain
