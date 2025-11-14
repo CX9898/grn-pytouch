@@ -291,16 +291,24 @@ __device__ __forceinline__ int8_t tanh_int16_lut(int16_t x, const int8_t* lut) {
 
 **疑问:**
 > - 实际流程中, 量化参数是我这里得到, 还是输入进来?
+> - > 效验得到
 > - 量化参数是 per-channel 的吗? 例如 W_scale.size = hidden_size * 3 ?
+> - > 量化参数是per-channel. 但是权重部分为三个不同值.
 > - Rh 和 br 是设置为同一个scale吗? Wx 和 bx 是设置为同一个scale吗?
+> - > 不是
 > - 对称和非对称量化的选择:
 >   - x: 非对称
 >   - h: 非对称
->   - W: 对称
->   - R: 对称
->   - z: 非对称
->   - r: 非对称
->   - g: 对称
+>   - W: 对称, per-channel
+>   - R: 对称, per-channel
+>   - bx: 对称, per-channel
+>   - br: 对称, per-channel
+>   - z_pre: 非对称
+>   - r_pre: 非对称
+>   - g_pre: 非对称
+>   - z_out: 非对称
+>   - r_out: 非对称
+>   - g_our: 对称
 > - 门控量化计算检查
 
 ## GruTrain
