@@ -25,28 +25,64 @@ struct ScaleParam3 { // 对应三个门: z, r, g
   int shift[3];         // shift, 右移位数，用于 CUDA kernel
 };
 
-struct GRUQuantScale {
-  std::vector<float> Wx_scale; // size = hidden * 3
-  std::vector<float> Rh_scale; // size = hidden * 3
+struct GRUQuantitativeParameters {
+  float scale_x_;
+  int32_t x_zp_;
+  float scale_h_;
+  int32_t h_zp_;
 
-  std::vector<float> z_pre; // size = hidden
-  std::vector<float> r_pre; // size = hidden
-  std::vector<float> g_pre; // size = hidden
+  std::vector<float> scale_W_; // size = hidden
+  std::vector<float> scale_R_; // size = hidden
 
-  std::vector<float> z_out; // size = hidden
-  std::vector<float> r_out; // size = hidden
-  std::vector<float> g_out; // size = hidden
+  float scale_bx_;
+  float scale_br_;
+
+  float scale_z_pre_;
+  int32_t zp_z_pre_;
+  float scale_r_pre_;
+  int32_t zp_r_pre_;
+  float scale_g_pre_;
+  int32_t zp_g_pre_;
+
+  float scale_z_out_;
+  int32_t zp_z_out_;
+  float scale_r_out_;
+  int32_t zp_r_out_;
+  float scale_g_out_;
+  int32_t zp_g_out_;
+
+  std::vector<float> scale_Wx_; // size = hidden
+  std::vector<float> scale_Rh_; // size = hidden
 };
 
-struct QuantGRUReScale { // size = hidden
-  dev::vector<ScaleParam> Rh_z_to_Wx_z;
-  dev::vector<ScaleParam> Rh_r_to_Wx_r;
-  dev::vector<ScaleParam> rRh_g_to_Wx_g;
-  dev::vector<ScaleParam> Wx_to_z_pre;
-  dev::vector<ScaleParam> Wx_to_r_pre;
-  dev::vector<ScaleParam> Wx_to_g_pre;
-  dev::vector<ScaleParam> zh_in_to_h_out;
-  dev::vector<ScaleParam> zg_to_h_out;
+struct QuantGRUReScale {
+  int32_t zp_x_;
+  int32_t zp_h_;
+
+  // z门
+  int32_t zp_z_pre_;
+  int32_t zp_z_out_;
+  dev::vector<int32_t> n_Wx_to_z_; // size = hidden
+  dev::vector<int32_t> n_Rh_to_z_;
+  dev::vector<int32_t> n_bx_to_z_;
+  dev::vector<int32_t> n_br_to_z_;
+
+  // r门
+  int32_t zp_r_pre_;
+  int32_t zp_r_out_;
+  dev::vector<int32_t> n_Wx_to_r_;
+  dev::vector<int32_t> n_Rh_to_r_;
+  dev::vector<int32_t> n_bx_to_r_;
+  dev::vector<int32_t> n_br_to_r_;
+
+  // g门
+  int32_t zp_g_pre_;
+  int32_t zp_g_out_;
+  dev::vector<int32_t> n_Rh_to_Rh_add_br_;
+  dev::vector<int32_t> n_br_to_Rh_add_br_;
+  dev::vector<int32_t> n_Wx_to_g_;
+  dev::vector<int32_t> n_rRh_to_g_;
+  dev::vector<int32_t> n_bx_to_g_;
 };
 
 struct QuantGRUMinMax {
@@ -120,6 +156,10 @@ struct GruQuantScales {
   QuantParams g;  // 输出门 g
 };
 
+void generate_int8_lut(float scale_z_pre, int32_t zp_z_pre, float scale_z_out, int32_t zp_z_out,
+                       float scale_r_pre, int32_t zp_r_pre, float scale_r_out, int32_t zp_r_out,
+                       float scale_g_pre, int32_t zp_g_pre, float scale_g_out, int32_t zp_g_out);
+
 
 /**
  * @brief 组合两个 scale 参数，计算结果的定点比例系数
@@ -155,8 +195,6 @@ inline ScaleParam3 combineScaleParam3(const ScaleParam3 &a, const ScaleParam &b)
     }
     return result;
 }
-
-
 
 
 template<typename T>
@@ -560,9 +598,10 @@ void quantizeFloatToIntPerStep(const float *src_dev,
                                int time_step_size);
 
 template<typename T>
-void computeWeightSum(
+void computeWeightSumMulzp(
     const T *W_q,// [out_dim, in_dim] 权重量化矩阵
     int32_t *weight_sum,// [out_dim] 输出数组
+    int zp,
     int out_dim,// 输出通道数 (M)
     int in_dim,// 输入通道数 (K)
     cudaStream_t stream = 0);
@@ -630,11 +669,11 @@ void calculateScaleZeroPointFromDevice(
     bool symmetric = true,
     cudaStream_t stream = 0);
 
-template<typename T>
-T findMaxValueFromDev(const T *dev_data, size_t size);
-
-template<typename T>
-T findMinValueFromDev(const T *dev_data, size_t size);
+//template<typename T>
+//T findMaxValueFromDev(const T *dev_data, size_t size);
+//
+//template<typename T>
+//T findMinValueFromDev(const T *dev_data, size_t size);
 
 /**
  * @brief 使用 (M, shift) 参数将量化值反量化为浮点数

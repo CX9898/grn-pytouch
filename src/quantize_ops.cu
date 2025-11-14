@@ -9,8 +9,9 @@
 #include "quantize_ops_helper.hpp"
 #include "quantize_ops.cuh"
 
-__constant__ int8_t d_sigmoid_lut[256];
-__constant__ int8_t d_tanh_lut[256];
+__constant__ int8_t d_sigmoid_int8_z_lut[256];
+__constant__ int8_t d_sigmoid_int8_r_lut[256];
+__constant__ int8_t d_tanh_int8_g_lut[256];
 
 /**
  * @brief 在 GPU 上将 float 数据量化为 int8
@@ -103,23 +104,58 @@ template void quantizeFloatToIntPerStep<int16_t, false, false, true>(const float
                                                                      const int32_t *zero_point_per_t,
                                                                      int time_step_size);
 
-
-void initLut() {
-    int8_t h_sigmoid_lut[256];
-    int8_t h_tanh_lut[256];
+std::vector<int8_t> generate_sigmoid_int8_lut(float scale_z_pre, int zp_z_pre,
+                                              float scale_z, int zp_z) {
+    std::vector<int8_t> lut(256);
 
     for (int i = 0; i < 256; i++) {
-        int8_t x = i - 128;         // [-128,127]
-        float fx = x / 128.0f;      // 转 float [-1,1]
-        float s = 1.f / (1.f + expf(-fx));
-        float t = tanhf(fx);
+        int x_i8 = i - 128;
 
-        h_sigmoid_lut[i] = static_cast<int8_t>(roundf(s * 127.f));
-        h_tanh_lut[i] = static_cast<int8_t>(roundf(t * 127.f));
+        const float x_fp = static_cast<float>(x_i8 - zp_z_pre) * scale_z_pre;
+        const float y_fp = 1.f / (1.f + std::exp(-x_fp));
+
+        int y_i8 = static_cast<int>(std::round(y_fp / scale_z + zp_z));
+        if (y_i8 < -128) y_i8 = -128;
+        if (y_i8 > 127) y_i8 = 127;
+
+        lut[i] = static_cast<int8_t>(y_i8);
     }
-    cudaMemcpyToSymbol(d_sigmoid_lut, h_sigmoid_lut, sizeof(int8_t) * 256); // 从host端拷贝到device端中编译期固定的地址
-    cudaMemcpyToSymbol(d_tanh_lut, h_tanh_lut, sizeof(int8_t) * 256); // 从host端拷贝到device端中编译期固定的地址
+    return lut;
+
 }
+
+std::vector<int8_t> generate_tanh_int8_lut(float scale_pre, int zp_pre,
+                                           float scale_out, int zp_out) {
+    std::vector<int8_t> lut(256);
+
+    for (int i = 0; i < 256; i++) {
+        int x_i8 = i - 128;
+
+        float x_fp = (x_i8 - zp_pre) * scale_pre;
+        float y_fp = std::tanh(x_fp);
+
+        int y_i8 = static_cast<int>(std::round(y_fp / scale_out + zp_out));
+        if (y_i8 < -128) y_i8 = -128;
+        if (y_i8 > 127) y_i8 = 127;
+
+        lut[i] = static_cast<int8_t>(y_i8);
+    }
+    return lut;
+
+}
+
+void generate_int8_lut(float scale_z_pre, int32_t zp_z_pre, float scale_z_out, int32_t zp_z_out,
+                       float scale_r_pre, int32_t zp_r_pre, float scale_r_out, int32_t zp_r_out,
+                       float scale_g_pre, int32_t zp_g_pre, float scale_g_out, int32_t zp_g_out) {
+    std::vector<int8_t> sigmoid_z_lut = generate_sigmoid_int8_lut(scale_z_pre, zp_z_pre, scale_z_out, zp_z_out);
+    std::vector<int8_t> sigmoid_r_lut = generate_sigmoid_int8_lut(scale_r_pre, zp_r_pre, scale_r_out, zp_r_out);
+    std::vector<int8_t> tanh_int8_lut = generate_tanh_int8_lut(scale_g_pre, zp_g_pre, scale_g_out, zp_g_out);
+
+    cudaMemcpyToSymbol(d_sigmoid_int8_z_lut, sigmoid_z_lut.data(), sizeof(int8_t) * 256); // 从host端拷贝到device端中编译期固定的地址
+    cudaMemcpyToSymbol(d_sigmoid_int8_r_lut, sigmoid_r_lut.data(), sizeof(int8_t) * 256); // 从host端拷贝到device端中编译期固定的地址
+    cudaMemcpyToSymbol(d_tanh_int8_g_lut, tanh_int8_lut.data(), sizeof(int8_t) * 256); // 从host端拷贝到device端中编译期固定的地址
+}
+
 
 //template<typename T>
 //void calculateScaleZeroPoint(const T *host_data, size_t size, float &scale, T &zero_point) {
@@ -184,9 +220,10 @@ __global__ void computeWeightSumTiled(
 }
 
 template<typename T>
-__global__ void computeWeightSum(
+__global__ void computeWeightSumMulzp(
     const T *__restrict__ W_q,   // [out_dim, in_dim] 权重量化矩阵
     int32_t *__restrict__ weight_sum, // [out_dim] 输出数组
+    int x_zp,
     int out_dim,                      // 输出通道数 (M)
     int in_dim                        // 输入通道数 (K)
 ) {
@@ -199,19 +236,21 @@ __global__ void computeWeightSum(
     for (int j = 0; j < in_dim; ++j) {
         sum += static_cast<int32_t>(row_ptr[j]);
     }
-    weight_sum[row] = sum;
+    weight_sum[row] = sum * x_zp;
 }
 
-template __global__ void computeWeightSum<int8_t>(
+template __global__ void computeWeightSumMulzp<int8_t>(
     const int8_t *__restrict__ W_q,   // [out_dim, in_dim] 权重量化矩阵
     int32_t *__restrict__ weight_sum, // [out_dim] 输出数组
+    int x_zp,
     int out_dim,                      // 输出通道数 (M)
     int in_dim                        // 输入通道数 (K)
 );
 
-template __global__ void computeWeightSum<int16_t>(
+template __global__ void computeWeightSumMulzp<int16_t>(
     const int16_t *__restrict__ W_q,   // [out_dim, in_dim] 权重量化矩阵
     int32_t *__restrict__ weight_sum, // [out_dim] 输出数组
+    int x_zp,
     int out_dim,                      // 输出通道数 (M)
     int in_dim                        // 输入通道数 (K)
 );
@@ -235,37 +274,40 @@ __global__ void applyZeroPointCompensation2D(
 } // kernel namespace
 
 template<typename T>
-void computeWeightSum(
+void computeWeightSumMulzp(
     const T *W_q,// [out_dim, in_dim] 权重量化矩阵
     int32_t *weight_sum,// [out_dim] 输出数组
+    int x_zp,
     int out_dim,// 输出通道数 (M)
     int in_dim,// 输入通道数 (K)
     cudaStream_t stream
 ) {
-    if (in_dim < 4096) {
-        int threads = 256;
-        int shared_mem = threads * sizeof(int32_t);
-        kernel::computeWeightSumTiled<<<out_dim, threads, shared_mem, stream>>>(
-            W_q, weight_sum, out_dim, in_dim
-        );
-    } else {
-        int threads = 256;
-        int blocks = (out_dim + threads - 1) / threads;
-        kernel::computeWeightSum<<<blocks, threads, 0, stream>>>(W_q, weight_sum, out_dim, in_dim);
-    }
+//    if (in_dim < 4096) {
+//        int threads = 256;
+//        int shared_mem = threads * sizeof(int32_t);
+//        kernel::computeWeightSumTiled<<<out_dim, threads, shared_mem, stream>>>(
+//            W_q, weight_sum, out_dim, in_dim
+//        );
+//    } else {
+    int threads = 256;
+    int blocks = (out_dim + threads - 1) / threads;
+    kernel::computeWeightSumMulzp<<<blocks, threads, 0, stream>>>(W_q, weight_sum, x_zp, out_dim, in_dim);
+//    }
 }
 
-template void computeWeightSum<int8_t>(
+template void computeWeightSumMulzp<int8_t>(
     const int8_t *W_q,// [out_dim, in_dim] 权重量化矩阵
     int32_t *weight_sum,// [out_dim] 输出数组
+    int x_zp,
     int out_dim,// 输出通道数 (M)
     int in_dim,// 输入通道数 (K)
     cudaStream_t stream
 );
 
-template void computeWeightSum<int16_t>(
+template void computeWeightSumMulzp<int16_t>(
     const int16_t *W_q,// [out_dim, in_dim] 权重量化矩阵
     int32_t *weight_sum,// [out_dim] 输出数组
+    int x_zp,
     int out_dim,// 输出通道数 (M)
     int in_dim,// 输入通道数 (K)
     cudaStream_t stream
@@ -625,56 +667,56 @@ template void calculateScaleZeroPointFromDevice<int8_t>(
 template void calculateScaleZeroPointFromDevice<int16_t>(
     const int16_t *h_dev, size_t size, float &scale, int32_t &zero_point, bool symmetric, cudaStream_t stream);
 
-template<typename T>
-T findMaxValueFromDev(const T *dev_data, size_t size) {
-    if (size == 0) {
-        // 边界处理：空数据返回最小值（避免访问非法内存）
-        return std::numeric_limits<T>::lowest();
-    }
-
-    // 直接用 thrust::max_element 找设备端最大值的迭代器
-    const T *max_it = thrust::max_element(thrust::device, dev_data, dev_data + size);
-
-    T max_val;
-    // 把设备端的最大值拷贝到主机端
-    thrust::copy(thrust::device, max_it, max_it + 1, &max_val);
-
-    return max_val;
-
-//    return thrust::reduce(thrust::device, dev_data, dev_data + size,
-//                          std::numeric_limits<T>::lowest(),
-//                          thrust::maximum<T>());
-}
-
-template int8_t findMaxValueFromDev<int8_t>(const int8_t *dev_data, size_t size);
-
-template int16_t findMaxValueFromDev<int16_t>(const int16_t *dev_data, size_t size);
-
-template float findMaxValueFromDev<float>(const float *dev_data, size_t size);
-
-template<typename T>
-T findMinValueFromDev(const T *dev_data, size_t size) {
-    if (size == 0) {
-        // 边界处理：空数据返回最大值（避免访问非法内存）
-        return std::numeric_limits<T>::max();
-    }
-
-    // 直接用 thrust::max_element 找设备端最大值的迭代器
-    const T *min_it = thrust::min_element(thrust::device, dev_data, dev_data + size);
-
-    T min_val;
-    // 把设备端的最大值拷贝到主机端
-    thrust::copy(thrust::device, min_it, min_it + 1, &min_val);
-
-    return min_val;
-
-//    return thrust::reduce(thrust::device, dev_data, dev_data + size,
-//                          std::numeric_limits<T>::lowest(),
-//                          thrust::maximum<T>());
-}
-
-template int8_t findMinValueFromDev<int8_t>(const int8_t *dev_data, size_t size);
-
-template int16_t findMinValueFromDev<int16_t>(const int16_t *dev_data, size_t size);
-
-template float findMinValueFromDev<float>(const float *dev_data, size_t size);
+//template<typename T>
+//T findMaxValueFromDev(const T *dev_data, size_t size) {
+//    if (size == 0) {
+//        // 边界处理：空数据返回最小值（避免访问非法内存）
+//        return std::numeric_limits<T>::lowest();
+//    }
+//
+//    // 直接用 thrust::max_element 找设备端最大值的迭代器
+//    const T *max_it = thrust::max_element(thrust::device, dev_data, dev_data + size);
+//
+//    T max_val;
+//    // 把设备端的最大值拷贝到主机端
+//    thrust::copy(thrust::device, max_it, max_it + 1, &max_val);
+//
+//    return max_val;
+//
+////    return thrust::reduce(thrust::device, dev_data, dev_data + size,
+////                          std::numeric_limits<T>::lowest(),
+////                          thrust::maximum<T>());
+//}
+//
+//template int8_t findMaxValueFromDev<int8_t>(const int8_t *dev_data, size_t size);
+//
+//template int16_t findMaxValueFromDev<int16_t>(const int16_t *dev_data, size_t size);
+//
+//template float findMaxValueFromDev<float>(const float *dev_data, size_t size);
+//
+//template<typename T>
+//T findMinValueFromDev(const T *dev_data, size_t size) {
+//    if (size == 0) {
+//        // 边界处理：空数据返回最大值（避免访问非法内存）
+//        return std::numeric_limits<T>::max();
+//    }
+//
+//    // 直接用 thrust::max_element 找设备端最大值的迭代器
+//    const T *min_it = thrust::min_element(thrust::device, dev_data, dev_data + size);
+//
+//    T min_val;
+//    // 把设备端的最大值拷贝到主机端
+//    thrust::copy(thrust::device, min_it, min_it + 1, &min_val);
+//
+//    return min_val;
+//
+////    return thrust::reduce(thrust::device, dev_data, dev_data + size,
+////                          std::numeric_limits<T>::lowest(),
+////                          thrust::maximum<T>());
+//}
+//
+//template int8_t findMinValueFromDev<int8_t>(const int8_t *dev_data, size_t size);
+//
+//template int16_t findMinValueFromDev<int16_t>(const int16_t *dev_data, size_t size);
+//
+//template float findMinValueFromDev<float>(const float *dev_data, size_t size);

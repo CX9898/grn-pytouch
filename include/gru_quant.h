@@ -95,6 +95,8 @@ class ForwardPassQuant {
       T *v,
       const int32_t *tmp_Wx,
       int32_t *tmp_Rh,
+      const int* W_sum_mul_x_zp, // hidden_size * 3
+      const int* R_sum_mul_h_zp, // hidden_size * 3
       const float zoneout_prob,
       const T *zoneout_mask);
 
