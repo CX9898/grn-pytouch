@@ -16,11 +16,6 @@
 
 namespace kernel {
 
-__device__ __forceinline__ int32_t rshift_round(int32_t x, int n) {
-    if (n <= 0) return x << (-n);  // 可支持负 shift（左移）
-    int32_t offset = 1 << (n - 1); // 四舍五入
-    return (x >= 0 ? (x + offset) : (x - offset)) >> n;
-}
 
 __device__ __forceinline__ int8_t computeZ( // 更新门z
     const int channel_idx,
@@ -32,12 +27,15 @@ __device__ __forceinline__ int8_t computeZ( // 更新门z
     const int32_t br_val,   // br 对应门的bias
     const QuantGRUReScale &rescale_params
 ) {
+    // z = sigmoid(Wx[z_idx] + Rh[z_idx] + bx[bz_idx] + br[bz_idx]);
+
+    const int32_t Wx = rshift_round(Wx_val, rescale_params.n_Wx_[channel_idx]) - W_sum_mul_x_zp + rescale_params.zp_Wx_;
+    const int32_t Rh = rshift_round(Rh_val, rescale_params.n_Rh_[channel_idx]) - R_sum_mul_h_zp + rescale_params.zp_Rh_;
+
     // scale_z_pre是通过效验阶段得到的; 通过sigmoid函数入口前的各项相加:Wx_val+Rh_val+bx_val+br_val的结果的的最大最小值计算得到
     const int8_t z_pre_i8 = dev::clamp<int8_t>( // clamp: 截断到int8的范围
-        rshift_round(Wx_val - W_sum_mul_x_zp, rescale_params.n_Wx_to_z_[channel_idx]) +
-        // n为: (scale_W * scale_x) / scale_z_pre ≈ 2^-n
-        rshift_round(Rh_val - R_sum_mul_h_zp, rescale_params.n_Rh_to_z_[channel_idx]) +
-        // n为: (scale_R * scale_h) / scale_z_pre ≈ 2^-n
+        rshift_round(Wx, rescale_params.n_Wx_to_z_) + // n为: scale_Wx / scale_z_pre ≈ 2^-n
+        rshift_round(Rh, rescale_params.n_Rh_to_z_) + // n为: scale_Rh / scale_z_pre ≈ 2^-n
         rshift_round(bx_val, rescale_params.n_bx_to_z_[channel_idx]) + // n为: scale_bx / scale_z_pre ≈ 2^-n; bx为X的偏置
         rshift_round(br_val, rescale_params.n_br_to_z_[channel_idx]) + // n为: scale_br / scale_z_pre ≈ 2^-n; br为R的偏置
         rescale_params.zp_z_pre_);
@@ -54,11 +52,16 @@ __device__ __forceinline__ int8_t computeR( // 重置门r
     const int32_t br_val,   // br 对应门的bias
     const QuantGRUReScale &rescale_params
 ) {
+    // r = sigmoid(Wx[r_idx] + Rh[r_idx] + bx[br_idx] + br[br_idx]);
+
+    const int32_t Wx = rshift_round(Wx_val, rescale_params.n_Wx_[channel_idx]) - W_sum_mul_x_zp + rescale_params.zp_Wx_;
+    const int32_t Rh = rshift_round(Rh_val, rescale_params.n_Rh_[channel_idx]) - R_sum_mul_h_zp + rescale_params.zp_Rh_;
+
     // scale_z_pre是通过效验阶段得到的; 通过sigmoid函数入口前的各项相加:Wx_val+Rh_val+bx_val+br_val的结果的的最大最小值计算得到
     const int8_t r_pre_i8 = dev::clamp<int8_t>( // clamp: 截断到int8的范围
-        rshift_round(Wx_val - W_sum_mul_x_zp, rescale_params.n_Wx_to_r_[channel_idx]) +
+        rshift_round(Wx, rescale_params.n_Wx_to_r_) +
         // n为: (scale_W * scale_x) / scale_r_pre ≈ 2^-n
-        rshift_round(Rh_val - R_sum_mul_h_zp, rescale_params.n_Rh_to_r_[channel_idx]) +
+        rshift_round(Rh, rescale_params.n_Rh_to_r_) +
         // n为: (scale_R * scale_h) / scale_r_pre ≈ 2^-n
         rshift_round(bx_val, rescale_params.n_bx_to_r_[channel_idx]) + // n为: scale_bx / scale_r_pre ≈ 2^-n; bx为X的偏置
         rshift_round(br_val, rescale_params.n_br_to_r_[channel_idx]) + // n为: scale_br / scale_r_pre ≈ 2^-n; br为R的偏置
@@ -66,7 +69,7 @@ __device__ __forceinline__ int8_t computeR( // 重置门r
     return dev::sigmoid_int8_lut(r_pre_i8, d_sigmoid_int8_r_lut);
 }
 
-__device__ __forceinline__ int8_t computeG( // 更新门
+__device__ __forceinline__ int8_t computeG( // New Gate
     const int channel_idx,
     const int32_t Wx_val,   // Wx 对应门的值
     const int32_t Rh_val,   // Rh 对应门的值
@@ -77,15 +80,22 @@ __device__ __forceinline__ int8_t computeG( // 更新门
     const int32_t r,
     const QuantGRUReScale &rescale_params
 ) {
-    const int64_t rRh_i64 = static_cast<int64_t>(r - rescale_params.zp_r_out_) *
-                            (rshift_round(Rh_val - R_sum_mul_h_zp, rescale_params.n_Rh_to_Rh_add_br_[channel_idx]) +
-                             rshift_round(br_val, rescale_params.n_br_to_Rh_add_br_[channel_idx]));
-    const int32_t rRh = dev::clamp<int32_t>(rRh_i64);
+    //  g = tanh (Wx[g_idx] + r * (Rh[g_idx] + br[bg_idx]) + bx[bg_idx]);
+
+    const int32_t Wx = rshift_round(Wx_val, rescale_params.n_Wx_[channel_idx]) - W_sum_mul_x_zp + rescale_params.zp_Wx_;
+    const int32_t Rh = rshift_round(Rh_val, rescale_params.n_Rh_[channel_idx]) - R_sum_mul_h_zp + rescale_params.zp_Rh_;
+    const int32_t Rh_add_br = rshift_round(Rh, rescale_params.n_Rh_to_Rh_add_br_) +
+                              rshift_round(bx_val, rescale_params.n_br_to_Rh_add_br_[channel_idx])
+    /*+ rescale_params.zp_Rh_add_br_*/;
+
+    const int32_t rRh = (r - rescale_params.zp_r_out_) *
+                        (Rh_add_br/* - rescale_params.zp_Rh_add_br_*/)
+                        /*+ rescale_params.zp_r_pre_*/;
 
     // 累加求和
     const int8_t g_pre_i8 = dev::clamp<int8_t>(
-        rshift_round(Wx_val - W_sum_mul_x_zp, rescale_params.n_Wx_to_g_[channel_idx]) +
-        rshift_round(rRh, rescale_params.n_rRh_to_g_[channel_idx]) +
+        rshift_round(Wx, rescale_params.n_Wx_to_g_[channel_idx]) +
+        rshift_round(rRh/* - rescale_params.zp_r_pre_*/, rescale_params.n_rRh_to_g_[channel_idx]) +
         rshift_round(bx_val, rescale_params.n_bx_to_g_[channel_idx]) +
         rescale_params.zp_g_pre_);
 
@@ -93,20 +103,26 @@ __device__ __forceinline__ int8_t computeG( // 更新门
 }
 
 __device__ __forceinline__ int8_t computeH( // 最终h
-    int hidden_idx,
     int8_t z,
     int8_t g,
     int8_t h_old,
     const QuantGRUReScale &rescale_params
 ) {
-    const int32_t zh_aligned = dev::rescale(static_cast<int32_t>(z) * static_cast<int32_t>(h_old),
-                                            rescale_params.zh_in_to_h_out[hidden_idx].M,
-                                            rescale_params.zh_in_to_h_out[hidden_idx].shift);
-    const int32_t zg_aligned = dev::rescale(static_cast<int32_t>(127 - z) * static_cast<int32_t>(g),
-                                            rescale_params.zg_to_h_out[hidden_idx].M,
-                                            rescale_params.zg_to_h_out[hidden_idx].shift);
+    // T cur_h_value = z * h[output_idx] + (static_cast<T>(1.0) - z) * g;
 
-    return dev::clamp<int8_t>(zh_aligned + zg_aligned);
+    const int32_t old_contrib =
+        rshift_round((z - rescale_params.zp_z_out_) * (h_old - rescale_params.zp_h_), rescale_params.n14_) +
+        rescale_params.zp_old_contrib_;
+
+    const int32_t one_minus_update = rescale_params.c12_ - rshift_round(z, rescale_params.n_one_minus_update_);
+    const int32_t new_contrib =
+        rshift_round(one_minus_update * (g - rescale_params.zp_g_out_), rescale_params.n13_) +
+        rescale_params.zp_new_contrib_;
+
+    return dev::clamp<int8_t>(
+        rshift_round(new_contrib, rescale_params.n15_) +
+        rshift_round(old_contrib, rescale_params.n16_) +
+        rescale_params.c15_);
 }
 
 // x : 非对称量化, scale分时间步不同
@@ -206,7 +222,7 @@ __global__ void PointwiseOperationsQuant(
         v[base_v_idx + 3 * hidden_dim] = Rh[g_idx] + br[b_g_idx];
     }
 
-    T cur_h_value = computeH(row, z, g, h[output_idx], re_scale_param);
+    T cur_h_value = computeH(z, g, h[output_idx], re_scale_param);
 
     /* 启用Zoneout, 对GRU 隐藏状态的随机保留 */
     // TODO: 支持量化
@@ -400,48 +416,95 @@ void ForwardPassQuant<T>::IterateInternal(
 }
 
 template<typename T>
-void ForwardPassQuant<T>::setRescaleParam(const QuantGRUScales &quantGruScales) {
-    const int hidden = quantGruScales.hidden;
-    std::vector<ScaleParam> Rh_z_to_Wx_z(hidden);
-    std::vector<ScaleParam> Rh_r_to_Wx_r(hidden);
-    std::vector<ScaleParam> rRh_g_to_Wx_g(hidden);
-    std::vector<ScaleParam> Wx_to_z_pre(hidden);
-    std::vector<ScaleParam> Wx_to_r_pre(hidden);
-    std::vector<ScaleParam> Wx_to_g_pre(hidden);
-    std::vector<ScaleParam> zh_in_to_h_out(hidden);
-    std::vector<ScaleParam> zg_to_h_out(hidden);
+void ForwardPassQuant<T>::setRescaleParam(const GRUQuantitativeParameters &parms) {
+    const int hidden = parms.hidden_;
+
+    // z门
+    std::vector<int32_t> n_Wx_to_z(hidden); // size = hidden (channel)
+    std::vector<int32_t> n_Rh_to_z(hidden);
+    std::vector<int32_t> n_bx_to_z(hidden);
+    std::vector<int32_t> n_br_to_z(hidden);
+
+    // r门
+    std::vector<int32_t> n_Wx_to_r(hidden);
+    std::vector<int32_t> n_Rh_to_r(hidden);
+    std::vector<int32_t> n_bx_to_r(hidden);
+    std::vector<int32_t> n_br_to_r(hidden);
+
+    // n门
+    std::vector<int32_t> n_Rh_to_Rh_add_br(hidden);
+    std::vector<int32_t> n_br_to_Rh_add_br(hidden);
+    std::vector<int32_t> n_Wx_to_g(hidden);
+    std::vector<int32_t> n_rRh_to_g(hidden);
+    std::vector<int32_t> n_bx_to_g(hidden);
 
     for (int idx = 0; idx < hidden; ++idx) { // per-channel
-        const float Wx = quantGruScales.Wx[idx];
-        const float Rh = quantGruScales.Rh[idx];
+        const float scale_Wx = parms.scale_Wx_;
+        const float scale_Rh = parms.scale_Rh_;
+        // z门
+        n_Wx_to_z[idx] = calculate_right_shift_bits(scale_Wx / parms.scale_z_pre_);
+        n_Rh_to_z[idx] = calculate_right_shift_bits(scale_Rh / parms.scale_z_pre_);
+        n_bx_to_z[idx] = calculate_right_shift_bits(parms.scale_bx_[idx] / parms.scale_z_pre_);
+        n_br_to_z[idx] = calculate_right_shift_bits(parms.scale_br_[idx] / parms.scale_z_pre_);
 
-        const float z_pre = quantGruScales.z_pre[idx];
-        const float r_pre = quantGruScales.r_pre[idx];
-        const float g_pre = quantGruScales.g_pre[idx];
+        // r门
+        n_Wx_to_r[idx] = calculate_right_shift_bits(scale_Wx / parms.scale_r_pre_);
+        n_Rh_to_r[idx] = calculate_right_shift_bits(scale_Rh / parms.scale_r_pre_);
+        n_bx_to_r[idx] = calculate_right_shift_bits(parms.scale_bx_[idx] / parms.scale_r_pre_);
+        n_br_to_r[idx] = calculate_right_shift_bits(parms.scale_br_[idx] / parms.scale_r_pre_);
 
-        const float z_out = quantGruScales.z_out[idx];
-        const float r_out = quantGruScales.r_out[idx];
-        const float g_out = quantGruScales.g_out[idx];
-
-        // Rh_z_to_Wx_z[idx] = computeRescaleParam(Rh_z, Wx_z);
-        // Rh_r_to_Wx_r[idx] = computeRescaleParam(Rh_r, Wx_r);
-        // rRh_g_to_Wx_g[idx] = computeRescaleParam(r_out * Rh_g, Wx_g);
-        // Wx_to_z_pre[idx] = computeRescaleParam(Wx_z, z_pre);
-        // Wx_to_r_pre[idx] = computeRescaleParam(Wx_r, r_pre);
-        // Wx_to_g_pre[idx] = computeRescaleParam(Wx_g, g_pre);
-        // zh_in_to_h_out[idx] = computeRescaleParam(z_out * h_in, h_out);
-        // zg_to_h_out[idx] = computeRescaleParam(z_out * g_out, h_out);
+        // n门
+        n_Rh_to_Rh_add_br[idx] = calculate_right_shift_bits(scale_Rh / parms.scale_Rh_add_br_[idx]);
+        n_br_to_Rh_add_br[idx] = calculate_right_shift_bits(parms.scale_br_[idx] / parms.scale_Rh_add_br_[idx]);
+        n_Wx_to_g[idx] = calculate_right_shift_bits(scale_Wx / parms.scale_g_pre_);
+        n_rRh_to_g[idx] = calculate_right_shift_bits(parms.scale_rRh_[idx] / parms.scale_g_pre_);
+        n_bx_to_g[idx] = calculate_right_shift_bits(parms.scale_bx_[idx] / parms.scale_g_pre_);
     }
 
+    /* init */
+    rescale_param_.zp_x_ = parms.zp_x_;
+    rescale_param_.zp_h_ = parms.zp_h_;
 
-    h2d(rescale_param_.Rh_z_to_Wx_z, Rh_z_to_Wx_z);
-    h2d(rescale_param_.Rh_r_to_Wx_r, Rh_r_to_Wx_r);
-    h2d(rescale_param_.rRh_g_to_Wx_g, rRh_g_to_Wx_g);
-    h2d(rescale_param_.Wx_to_z_pre, Wx_to_z_pre);
-    h2d(rescale_param_.Wx_to_r_pre, Wx_to_r_pre);
-    h2d(rescale_param_.Wx_to_g_pre, Wx_to_g_pre);
-    h2d(rescale_param_.zh_in_to_h_out, zh_in_to_h_out);
-    h2d(rescale_param_.zg_to_h_out, zg_to_h_out);
+    // z门
+    rescale_param_.zp_z_pre_ = parms.zp_z_pre_;
+    rescale_param_.zp_z_out_ = parms.zp_z_out_;
+    h2d(rescale_param_.n_Wx_to_z_, n_Wx_to_z);
+    h2d(rescale_param_.n_Rh_to_z_, n_Rh_to_z);
+    h2d(rescale_param_.n_bx_to_z_, n_bx_to_z);
+    h2d(rescale_param_.n_br_to_z_, n_br_to_z);
+
+    // r门
+    rescale_param_.zp_r_pre_ = parms.zp_r_pre_;
+    rescale_param_.zp_r_out_ = parms.zp_r_out_;
+    h2d(rescale_param_.n_Wx_to_r_, n_Wx_to_r);
+    h2d(rescale_param_.n_Rh_to_r_, n_Rh_to_r);
+    h2d(rescale_param_.n_bx_to_r_, n_bx_to_r);
+    h2d(rescale_param_.n_br_to_r_, n_br_to_r);
+
+    // n门
+    rescale_param_.zp_g_pre_ = parms.zp_g_pre_;
+    rescale_param_.zp_g_out_ = parms.zp_g_out_;
+    h2d(rescale_param_.n_Rh_to_Rh_add_br_, n_Rh_to_Rh_add_br);
+    h2d(rescale_param_.n_br_to_Rh_add_br_, n_br_to_Rh_add_br);
+    h2d(rescale_param_.n_Wx_to_g_, n_Wx_to_g);
+    h2d(rescale_param_.n_rRh_to_g_, n_rRh_to_g);
+    h2d(rescale_param_.n_bx_to_g_, n_bx_to_g);
+
+    // h_new
+    rescale_param_.n_one_minus_update_ = calculate_right_shift_bits(parms.scale_one_minus_update_);
+    rescale_param_.c12_ =
+        calculate_one_over_Somu(parms.scale_one_minus_update_) +
+        rshift_round(parms.zp_z_out_,
+                     calculate_right_shift_bits(parms.scale_z_out_ / parms.scale_one_minus_update_)); // 不需要加zp_omu
+    rescale_param_.zp_new_contrib_ = parms.zp_new_contrib_;
+    rescale_param_.n13_ = calculate_right_shift_bits(
+        (parms.scale_one_minus_update_ * parms.scale_g_out_) / parms.scale_new_contrib_);
+    rescale_param_.n14_ = calculate_right_shift_bits((parms.scale_z_out_ * parms.scale_h_) / parms.scale_old_contrib_);
+    rescale_param_.zp_old_contrib_ = parms.zp_old_contrib_;
+    rescale_param_.n15_ = calculate_right_shift_bits(parms.scale_new_contrib_ / parms.scale_h_);
+    rescale_param_.n16_ = calculate_right_shift_bits(parms.scale_old_contrib_ / parms.scale_h_);
+    rescale_param_.c15_ = parms.zp_h_ - (rshift_round(parms.zp_new_contrib_, rescale_param_.n15_) +
+                                         rshift_round(parms.zp_old_contrib_, rescale_param_.n16_));
 }
 
 // C = input_size(输入维度), H = hidden_size(隐藏层维度),
@@ -493,11 +556,11 @@ void ForwardPassQuant<T>::Run(const int steps, // 时间步数, 序列长度T
 
     // 计算W_sum_mul_zp用于补偿x_zp
     dev::vector<int32_t> W_sum_mul_x_zp(hidden_size * 3);
-    computeWeightSumMulzp(W, W_sum_mul_x_zp.data(), rescale_param_.x_zp, W_sum_mul_x_zp.size(), input_size, stream2);
+    computeWeightSumMulzp(W, W_sum_mul_x_zp.data(), rescale_param_.zp_x_, W_sum_mul_x_zp.size(), input_size, stream2);
 
     // Rh的gemm需要补偿h_zp, 所以提前计算 h_zp * R_sum * h_zp, stream1
     dev::vector<int32_t> R_sum_mul_h_zp(hidden_size * 3);
-    computeWeightSumMulzp(R, R_sum_mul_h_zp.data(), rescale_param_.h_zp, R_sum_mul_h_zp.size(), input_size, stream1);
+    computeWeightSumMulzp(R, R_sum_mul_h_zp.data(), rescale_param_.zp_h_, R_sum_mul_h_zp.size(), input_size, stream1);
 
     // 同步Wx计算
     cudaEventRecord(event, stream2);

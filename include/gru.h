@@ -18,6 +18,9 @@
 #include <cublas_v2.h>
 #include <cuda_runtime_api.h>
 
+#include <optional>
+#include "quantize_ops_helper.hpp"
+
 namespace gru {
 
 template<typename T>
@@ -29,17 +32,25 @@ class ForwardPass {
   // hidden_size: the expected dimension of each output vector.
   // blas_handle: an initialized cuBLAS handle (see `cublasCreate`).
   ForwardPass(
-      const bool calibration,
       const bool training,
       const int batch_size,
       const int input_size,
       const int hidden_size,
-      const cublasHandle_t& blas_handle,
-      const cudaStream_t& stream = 0);
+      const cublasHandle_t &blas_handle,
+      const cudaStream_t &stream = 0);
 
   // Releases internal resources.
   // Blocks until all iterations have completed executing on the GPU.
   ~ForwardPass();
+
+  void setCalibrationMode(bool calibration_mode, bool use_int16_quant) {
+      calibration_mode_ = calibration_mode;
+      use_int16_quant_ = use_int16_quant;
+  }
+
+  const GRUQuantitativeParameters &getGRUQuantitativeParameters() const {
+      return quant_parms_;
+  }
 
   // Performs one forward iteration of the GRU cell.
   //
@@ -69,48 +80,52 @@ class ForwardPass {
   //     following a Bernoulli(1-zoneout_prob) distribution. A different mask is typically
   //     used for each iteration.
   void Iterate(
-      const T* W,
-      const T* R,
-      const T* bx,
-      const T* br,
-      const T* x,
-      const T* h,
-      T* h_out,
-      T* v,
-      T* tmp_Wx,
-      T* tmp_Rh,
+      const T *W,
+      const T *R,
+      const T *bx,
+      const T *br,
+      const T *x,
+      const T *h,
+      T *h_out,
+      T *v,
+      T *tmp_Wx,
+      T *tmp_Rh,
       const float zoneout_prob,
-      const T* zoneout_mask);
+      const T *zoneout_mask);
 
   void Run(
       const int steps,
-      const T* W,
-      const T* R,
-      const T* bx,
-      const T* br,
-      const T* x,
-      T* h,
-      T* v,
-      T* tmp_Wx,
-      T* tmp_Rh,
+      const T *W,
+      const T *R,
+      const T *bx,
+      const T *br,
+      const T *x,
+      T *h,
+      T *v,
+      T *tmp_Wx,
+      T *tmp_Rh,
       const float zoneout_prob,
-      const T* zoneout_mask);
+      const T *zoneout_mask);
 
  private:
   void IterateInternal(
-      const T* R,
-      const T* bx,
-      const T* br,
-      const T* h,
-      T* h_out,
-      T* v,
-      T* tmp_Wx,
-      T* tmp_Rh,
+      const T *R,
+      const T *bx,
+      const T *br,
+      const T *h,
+      T *h_out,
+      T *v,
+      T *tmp_Wx,
+      T *tmp_Rh,
       const float zoneout_prob,
-      const T* zoneout_mask);
+      const T *zoneout_mask);
 
   struct private_data;
-  private_data* data_;
+  private_data *data_;
+
+  bool calibration_mode_ = false;
+  bool use_int16_quant_ = false;
+  GRUQuantitativeParameters quant_parms_;
 };
 
 template<typename T>
@@ -124,8 +139,8 @@ class BackwardPass {
       const int batch_size,
       const int input_size,
       const int hidden_size,
-      const cublasHandle_t& blas_handle,
-      const cudaStream_t& stream = 0);
+      const cublasHandle_t &blas_handle,
+      const cudaStream_t &stream = 0);
 
   // Releases internal resources.
   // Blocks until all iterations have completed executing on the GPU.
@@ -169,59 +184,59 @@ class BackwardPass {
   // zoneout_mask: [N,H] may be null if zoneout was disabled in the forward pass. This vector
   //     must be the same as the one provided during the corresponding forward iteration.
   void Iterate(
-      const T* W_t,
-      const T* R_t,
-      const T* bx,
-      const T* br,
-      const T* x_t,
-      const T* h,
-      const T* v,
-      const T* dh_new,
-      T* dx,
-      T* dW,
-      T* dR,
-      T* dbx,
-      T* dbr,
-      T* dh,
-      T* dp,
-      T* dq,
-      const T* zoneout_mask);
+      const T *W_t,
+      const T *R_t,
+      const T *bx,
+      const T *br,
+      const T *x_t,
+      const T *h,
+      const T *v,
+      const T *dh_new,
+      T *dx,
+      T *dW,
+      T *dR,
+      T *dbx,
+      T *dbr,
+      T *dh,
+      T *dp,
+      T *dq,
+      const T *zoneout_mask);
 
   void Run(
       const int steps,
-      const T* W_t,
-      const T* R_t,
-      const T* bx,
-      const T* br,
-      const T* x_t,
-      const T* h,
-      const T* v,
-      const T* dh_new,
-      T* dx,
-      T* dW,
-      T* dR,
-      T* dbx,
-      T* dbr,
-      T* dh,
-      T* dp,
-      T* dq,
-      const T* zoneout_mask);
+      const T *W_t,
+      const T *R_t,
+      const T *bx,
+      const T *br,
+      const T *x_t,
+      const T *h,
+      const T *v,
+      const T *dh_new,
+      T *dx,
+      T *dW,
+      T *dR,
+      T *dbx,
+      T *dbr,
+      T *dh,
+      T *dp,
+      T *dq,
+      const T *zoneout_mask);
 
  private:
   void IterateInternal(
-      const T* R_t,
-      const T* h,
-      const T* v,
-      const T* dh_new,
-      T* dbx,
-      T* dbr,
-      T* dh,
-      T* dp,
-      T* dq,
-      const T* zoneout_mask);
+      const T *R_t,
+      const T *h,
+      const T *v,
+      const T *dh_new,
+      T *dbx,
+      T *dbr,
+      T *dh,
+      T *dp,
+      T *dq,
+      const T *zoneout_mask);
 
   struct private_data;
-  private_data* data_;
+  private_data *data_;
 };
 
 }  // namespace gru

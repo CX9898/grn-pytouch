@@ -224,6 +224,7 @@ __global__ void computeWeightSumMulzp(
     const T *__restrict__ W_q,   // [out_dim, in_dim] 权重量化矩阵
     int32_t *__restrict__ weight_sum, // [out_dim] 输出数组
     int x_zp,
+    int32_t n, //
     int out_dim,                      // 输出通道数 (M)
     int in_dim                        // 输入通道数 (K)
 ) {
@@ -236,13 +237,14 @@ __global__ void computeWeightSumMulzp(
     for (int j = 0; j < in_dim; ++j) {
         sum += static_cast<int32_t>(row_ptr[j]);
     }
-    weight_sum[row] = sum * x_zp;
+    weight_sum[row] = rshift_round(sum * x_zp, n);
 }
 
 template __global__ void computeWeightSumMulzp<int8_t>(
     const int8_t *__restrict__ W_q,   // [out_dim, in_dim] 权重量化矩阵
     int32_t *__restrict__ weight_sum, // [out_dim] 输出数组
     int x_zp,
+    int32_t n, //
     int out_dim,                      // 输出通道数 (M)
     int in_dim                        // 输入通道数 (K)
 );
@@ -251,6 +253,7 @@ template __global__ void computeWeightSumMulzp<int16_t>(
     const int16_t *__restrict__ W_q,   // [out_dim, in_dim] 权重量化矩阵
     int32_t *__restrict__ weight_sum, // [out_dim] 输出数组
     int x_zp,
+    int32_t n, //
     int out_dim,                      // 输出通道数 (M)
     int in_dim                        // 输入通道数 (K)
 );
@@ -278,6 +281,7 @@ void computeWeightSumMulzp(
     const T *W_q,// [out_dim, in_dim] 权重量化矩阵
     int32_t *weight_sum,// [out_dim] 输出数组
     int x_zp,
+    int32_t n, //
     int out_dim,// 输出通道数 (M)
     int in_dim,// 输入通道数 (K)
     cudaStream_t stream
@@ -291,7 +295,7 @@ void computeWeightSumMulzp(
 //    } else {
     int threads = 256;
     int blocks = (out_dim + threads - 1) / threads;
-    kernel::computeWeightSumMulzp<<<blocks, threads, 0, stream>>>(W_q, weight_sum, x_zp, out_dim, in_dim);
+    kernel::computeWeightSumMulzp<<<blocks, threads, 0, stream>>>(W_q, weight_sum, x_zp, n, out_dim, in_dim);
 //    }
 }
 
@@ -299,6 +303,7 @@ template void computeWeightSumMulzp<int8_t>(
     const int8_t *W_q,// [out_dim, in_dim] 权重量化矩阵
     int32_t *weight_sum,// [out_dim] 输出数组
     int x_zp,
+    int32_t n, //
     int out_dim,// 输出通道数 (M)
     int in_dim,// 输入通道数 (K)
     cudaStream_t stream
@@ -308,6 +313,7 @@ template void computeWeightSumMulzp<int16_t>(
     const int16_t *W_q,// [out_dim, in_dim] 权重量化矩阵
     int32_t *weight_sum,// [out_dim] 输出数组
     int x_zp,
+    int32_t n, //
     int out_dim,// 输出通道数 (M)
     int in_dim,// 输入通道数 (K)
     cudaStream_t stream
@@ -326,292 +332,6 @@ void applyZeroPointCompensation2D(
     kernel::applyZeroPointCompensation2D<<<blocks, threads, 0, stream>>>(
         Y_int32, weight_sum, x_zp, out_dim, batch_size
     );
-}
-
-inline ScaleParam computeRescaleParamFixedShift(float src_scale, float dst_scale, int fixed_shift) {
-    ScaleParam param;
-
-    if (src_scale <= 0.0f || dst_scale <= 0.0f) {
-        // 避免非法 scale
-        param.M = 1;
-        param.shift = fixed_shift;
-        return param;
-    }
-
-    // 计算浮点比例
-    double scale_ratio = static_cast<double>(src_scale) / static_cast<double>(dst_scale);
-
-    // 根据固定 shift 计算整数 multiplier
-    int64_t multiplier_long = static_cast<int64_t>(std::round(scale_ratio * (1LL << fixed_shift)));
-
-    // 防止 int32 溢出
-    if (multiplier_long > std::numeric_limits<int32_t>::max()) multiplier_long = std::numeric_limits<int32_t>::max();
-    if (multiplier_long < std::numeric_limits<int32_t>::min()) multiplier_long = std::numeric_limits<int32_t>::min();
-
-    param.M = static_cast<int32_t>(multiplier_long);
-    param.shift = fixed_shift;
-
-    return param;
-}
-
-
-/**
- * @brief 计算量化参数（对称或非对称）
- * @tparam QuantT   目标量化类型（如 int8_t 或 int16_t）
- * @param data      输入浮点数据指针
- * @param size      数据长度
- * @param symmetric 是否使用对称量化（默认为 true）
- * @return QuantParams 量化参数结构体
- */
-template<typename QuantT>
-inline QuantParams calculateQuantParams(
-    const float *data,
-    size_t size,
-    bool symmetric) {
-
-    if (data == nullptr || size == 0) {
-        QuantParams params;
-        params.scale = 1.0f;
-        params.zero_point = 0;
-        return params;
-    }
-
-    // 并行找出最大最小值
-    float max_val = data[0];
-    float min_val = data[0];
-
-#pragma omp parallel for reduction(max:max_val) reduction(min:min_val)
-    for (size_t i = 1; i < size; ++i) {
-        const float v = data[i];
-        if (v > max_val) max_val = v;
-        if (v < min_val) min_val = v;
-    }
-
-    return calculateQuantParams<QuantT>(max_val, min_val, symmetric);
-}
-
-template QuantParams calculateQuantParams<int8_t>(
-    const float *data,
-    size_t size,
-    bool symmetric);
-
-template<typename QuantT>
-GruQuantScales computeGruQuantParams(const float *x, int steps, int N, int C,
-                                     const float *W, int H,
-                                     const float *R,
-                                     const float *bx, const float *br) {
-    GruQuantScales q;
-
-    // 计算输入 x 的 scale/zp
-    q.x_scale.resize(steps);
-    q.x_zp.resize(steps);
-    for (int i = 0; i < steps; ++i) {
-        QuantParams x_quantParams = calculateQuantParams<QuantT>(x + i * N * C, N * C, false);
-        q.x_scale[i] = x_quantParams.scale;
-        q.x_zp[i] = x_quantParams.zero_point;
-    }
-
-    for (int gate_idx = 0; gate_idx < 3; ++gate_idx) { // z, r, g
-        // W 分片: [C, H*3] → 每 H 对应一个门
-        q.W.gate[gate_idx] = calculateQuantParams<QuantT>(W + gate_idx * C * H, C * H);
-
-        // R 分片: [H, H*3]
-        q.R.gate[gate_idx] = calculateQuantParams<QuantT>(R + gate_idx * H * H, H * H);
-
-        // bias 分片: [H*3]
-        q.bx.gate[gate_idx] = calculateQuantParams<QuantT>(bx + gate_idx * H, H);
-        q.br.gate[gate_idx] = calculateQuantParams<QuantT>(br + gate_idx * H, H);
-    }
-
-    // 计算Wx scale
-    q.Wx.resize(steps);
-#pragma omp parallel for
-    for (int t = 0; t < steps; ++t) {
-        for (int g = 0; g < 3; ++g) {
-            // --- Wx[t] = x[t] * W ---
-            q.Wx[t].gate[g].scale = q.x_scale[t] * q.W.gate[g].scale;
-            q.Wx[t].gate[g].zero_point = 0;
-        }
-    }
-
-    // sigmoid 输出 [0, 1]，LUT 映射到 [0, 127]
-    // 所以 scale 应该是 1.0f / 127.0f，但为了与 int8 范围一致，使用 1.0f / 255.0f
-    // 注意：LUT 输出范围是 [0, 127]，但 scale 使用 1.0f / 255.0f 是为了保持一致性
-    q.z.scale = q.r.scale = 1.0f / 127.0f; // 修正：sigmoid LUT 输出范围是 [0, 127]
-    q.z.zero_point = q.r.zero_point = 0;
-
-    // tanh 输出 [-1, 1]，LUT 映射到 [-128, 127]
-    // 所以 scale 应该是 2.0f / 255.0f
-    q.g.scale = 2.0f / 255.0f;
-    q.g.zero_point = 128; // 对称中心为 0
-
-    return q;
-}
-
-template GruQuantScales computeGruQuantParams<int8_t>(const float *x, int steps, int N, int C,
-                                                      const float *W, int H,
-                                                      const float *R,
-                                                      const float *bx, const float *br);
-
-template GruQuantScales computeGruQuantParams<int16_t>(const float *x, int steps, int N, int C,
-                                                       const float *W, int H,
-                                                       const float *R,
-                                                       const float *bx, const float *br);
-
-template GruQuantScales computeGruQuantParams<int32_t>(const float *x, int steps, int N, int C,
-                                                       const float *W, int H,
-                                                       const float *R,
-                                                       const float *bx, const float *br);
-
-
-/**
- * @brief 计算每个时间步的 ScaleParam3 参数（用于 Wx）
- *
- * @param steps           [in] 时间步数（序列长度）
- * @param x_scales        [in] 每个时间步输入 x 的量化 scale, size = steps
- * @param w_scale_z       [in] Wz 的对称量化 scale
- * @param w_scale_r       [in] Wr 的对称量化 scale
- * @param w_scale_g       [in] Wg 的对称量化 scale
- * @param rescale_params  [out] 每步输出的 ScaleParam3 数组, size = steps
- */
-void computeWxRescaleParamsFixedShift(
-    int steps,
-    const std::vector<float> &x_scales,
-    const float w_scale_z,
-    const float w_scale_r,
-    const float w_scale_g,
-    std::vector<ScaleParam3> &rescale_params
-) {
-    rescale_params.resize(steps);
-    constexpr int MAX_SHIFT = 31;
-
-    for (int t = 0; t < steps; ++t) {
-        // ---------- 计算每步的浮点 scale ----------
-        float scale_z = x_scales[t] * w_scale_z;
-        float scale_r = x_scales[t] * w_scale_r;
-        float scale_g = x_scales[t] * w_scale_g;
-
-        const float scales[3] = {scale_z, scale_r, scale_g};
-
-        ScaleParam3 p{};
-        for (int gate = 0; gate < 3; ++gate) {
-            float scale_val = scales[gate];
-
-            // ---------- 转换为定点 M 和 shift ----------
-            int shift = 0;
-            double M_f = 0.0;
-            for (shift = 0; shift <= MAX_SHIFT; ++shift) {
-                M_f = scale_val * (1LL << shift);
-                if (M_f >= 1.0 && M_f < static_cast<double>(1LL << 31))
-                    break;
-            }
-
-            int32_t M = static_cast<int32_t>(std::round(M_f));
-            p.M[gate] = M;
-            p.shift[gate] = shift;
-        }
-
-        rescale_params[t] = p;
-    }
-}
-
-/**
- * @brief 计算每个时间步的所有 RescaleParamsPerStep 参数
- */
-void computeGruRescaleParamsPerStep(
-    int steps,
-    GruQuantScales &gruQuantScales,
-    std::vector<RescaleParamsPerStep> &rescale_params,
-    int fixed_shift) {
-    rescale_params.resize(steps);
-
-    gruQuantScales.h_scale.resize(steps + 1);
-
-    // h 的 scale 将在运行时动态计算（使用指数移动平均：90% 上一步 + 10% 当前步）
-    // 初始化 rescale 参数数组的大小（实际参数将在运行时动态更新）
-    rescale_params.resize(steps);
-
-    for (int t = 0; t < steps; ++t) {
-        RescaleParamsPerStep &params = rescale_params[t];
-
-        // 计算 Wx 的 scale（每步每个门）
-        const float wx_scale_z = gruQuantScales.x_scale[t] * gruQuantScales.W.gate[0].scale;
-        const float wx_scale_r = gruQuantScales.x_scale[t] * gruQuantScales.W.gate[1].scale;
-        const float wx_scale_g = gruQuantScales.x_scale[t] * gruQuantScales.W.gate[2].scale;
-
-        gruQuantScales.Wx[t].gate[0].scale = wx_scale_z;
-        gruQuantScales.Wx[t].gate[1].scale = wx_scale_r;
-        gruQuantScales.Wx[t].gate[2].scale = wx_scale_g;
-
-        // 计算h初始时间步的scale
-//        if (t == 0) {
-//            // 初始化 h_scale（使用 g 的 scale 作为初始值）
-//            const float h_scale_original = gruQuantScales.g.scale;
-//            gruQuantScales.h_scale[0] = h_scale_original;
-//            computeRhScale(t, gruQuantScales, params, fixed_shift);
-//        }
-
-        // 计算 bx_to_Wx 的 rescale 参数（每个门）
-        params.bx_to_Wx.M[0] = computeRescaleParamFixedShift(gruQuantScales.bx.gate[0].scale,
-                                                             wx_scale_z,
-                                                             fixed_shift).M;
-        params.bx_to_Wx.shift[0] = fixed_shift;
-        params.bx_to_Wx.M[1] = computeRescaleParamFixedShift(gruQuantScales.bx.gate[1].scale,
-                                                             wx_scale_r,
-                                                             fixed_shift).M;
-        params.bx_to_Wx.shift[1] = fixed_shift;
-        params.bx_to_Wx.M[2] = computeRescaleParamFixedShift(gruQuantScales.bx.gate[2].scale,
-                                                             wx_scale_g,
-                                                             fixed_shift).M;
-        params.bx_to_Wx.shift[2] = fixed_shift;
-
-        // 计算 br_to_Wx 的 rescale 参数（每个门）
-        params.br_to_Wx.M[0] = computeRescaleParamFixedShift(gruQuantScales.br.gate[0].scale,
-                                                             wx_scale_z,
-                                                             fixed_shift).M;
-        params.br_to_Wx.shift[0] = fixed_shift;
-        params.br_to_Wx.M[1] = computeRescaleParamFixedShift(gruQuantScales.br.gate[1].scale,
-                                                             wx_scale_r,
-                                                             fixed_shift).M;
-        params.br_to_Wx.shift[1] = fixed_shift;
-        params.br_to_Wx.M[2] = computeRescaleParamFixedShift(gruQuantScales.br.gate[2].scale,
-                                                             wx_scale_g,
-                                                             fixed_shift).M;
-        params.br_to_Wx.shift[2] = fixed_shift;
-
-        // 计算 Wx_to_out 的 rescale 参数（每个门）
-        // 激活函数输入的 scale：LUT 输入是 int8，范围 [-128, 127]
-        // sigmoid/tanh LUT 的输入 scale 应该与 LUT 的设计一致
-        // 从 initLut() 可以看到：x / 128.0f 映射到 [-1, 1]，所以输入 scale 是 1.0f / 128.0f
-        // 但是，由于我们需要将 int32 累加结果量化回 int8，我们需要知道激活函数输入的 scale
-        // 实际上，激活函数输入的 scale 应该与激活函数输出的 scale 相关
-        // 对于 sigmoid：输入 scale 可以设置为一个合理的值，例如 1.0f / 128.0f（对应 LUT 输入范围）
-        // 对于 tanh：同样使用 1.0f / 128.0f
-        // 但是，为了简化，我们可以使用一个统一的 scale，例如 1.0f / 128.0f
-        float activation_input_scale = 1.0f / 128.0f; // LUT 输入 scale：int8 [-128,127] 映射到 [-1,1]
-        params.Wx_to_out.M[0] = computeRescaleParamFixedShift(wx_scale_z, activation_input_scale, fixed_shift).M;
-        params.Wx_to_out.shift[0] = fixed_shift;
-        params.Wx_to_out.M[1] = computeRescaleParamFixedShift(wx_scale_r, activation_input_scale, fixed_shift).M;
-        params.Wx_to_out.shift[1] = fixed_shift;
-        params.Wx_to_out.M[2] = computeRescaleParamFixedShift(wx_scale_g, activation_input_scale, fixed_shift).M;
-        params.Wx_to_out.shift[2] = fixed_shift;
-
-        // 计算 r_to_Wx_g 的 rescale 参数
-        // 用于计算 r * (Rh_aligned_g + br_aligned_g)
-        // r 输出的 scale 是 S_r = 1.0f / 127.0f（sigmoid LUT 输出范围是 [0, 127]）
-        // (Rh_aligned_g + br_aligned_g) 的 scale 是 S_Wx_g（已经对齐到 Wx_g）
-        // r * (Rh_aligned_g + br_aligned_g) 的 scale 是 S_r * S_Wx_g
-        // 需要 rescale 到 S_Wx_g，所以需要除以 S_r，即乘以 1/S_r = 127.0f
-        // 因此，r_to_Wx_g 的参数应该是将 scale (S_r * S_Wx_g) rescale 到 S_Wx_g
-        float r_output_scale = gruQuantScales.r.scale; // 1.0f / 127.0f（根据 initLut，sigmoid 输出范围是 [0, 127]）
-        // wx_scale_g 已经在上面计算过（第521行）
-        // 计算将 (r * value_with_scale_Wx_g) 的结果 rescale 到 Wx_g 的参数
-        // 即：将 scale (S_r * S_Wx_g) rescale 到 S_Wx_g，需要乘以 1/S_r
-        ScaleParam r_to_wx_g = computeRescaleParamFixedShift(r_output_scale * wx_scale_g, wx_scale_g, fixed_shift);
-        params.r_to_Wx_g.M = r_to_wx_g.M;
-        params.r_to_Wx_g.shift = r_to_wx_g.shift;
-    }
-
 }
 
 /**
@@ -666,7 +386,7 @@ template void calculateScaleZeroPointFromDevice<int8_t>(
 
 template void calculateScaleZeroPointFromDevice<int16_t>(
     const int16_t *h_dev, size_t size, float &scale, int32_t &zero_point, bool symmetric, cudaStream_t stream);
-
+//
 //template<typename T>
 //T findMaxValueFromDev(const T *dev_data, size_t size) {
 //    if (size == 0) {

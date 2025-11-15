@@ -114,7 +114,7 @@ __device__ __forceinline__ int8_t sigmoid_int16_lut(int16_t x) { // (TODO: 二�
     int32_t tmp = static_cast<int32_t>(x) + 32768; // 转为 [0, 65535]
     tmp = (tmp * 255 + 65535 / 2) / 65535; // 四舍五入缩放到 [0, 255]
     int8_t idx = static_cast<int8_t>(tmp - 128); // 转为 [-128, 127]
-    return d_sigmoid_lut[static_cast<uint8_t>(idx)];
+//    return d_sigmoid_lut[static_cast<uint8_t>(idx)];
 
     // -10到10分成N32段, 每段用二次多项式拟合
 
@@ -127,7 +127,7 @@ __device__ __forceinline__ int8_t tanh_int16_lut(int16_t x) { // (TODO: 二项�
     int32_t tmp = static_cast<int32_t>(x) + 32768; // int16_t [-32768, 32767] → [0, 65535]
     tmp = (tmp * 255 + 65535 / 2) / 65535; // 缩放到 [0, 255]（四舍五入）
     int8_t idx = static_cast<int8_t>(tmp - 128); // → [-128, 127]
-    return d_tanh_lut[static_cast<uint8_t>(idx)]; // 用索引访问 tanh LUT
+//    return d_tanh_lut[static_cast<uint8_t>(idx)]; // 用索引访问 tanh LUT
 }
 
 __device__ __forceinline__ int32_t round_shift(int32_t val, int shift) {

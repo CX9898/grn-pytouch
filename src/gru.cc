@@ -72,7 +72,7 @@ void GruQuantInit(
     Tensor1i32 &br_quant,
     Tensor3i8 &x_quant,
     Tensor3i8 &dh_new_quant,
-    const QuantGRUScales &gruRescaleParams
+    const GRUQuantitativeParameters &gruRescaleParams
 ) {
     const int time_steps = x.dimension(2);
     const int batch_size = x.dimension(1);
@@ -97,7 +97,7 @@ void GruInferenceQuant(const Tensor2i8 &W,
                        const Tensor1i32 &bx,
                        const Tensor1i32 &br,
                        const Tensor3i8 &x,
-                       const QuantGRUScales quant_gru_scales,
+                       const GRUQuantitativeParameters &quant_parms,
                        Tensor3i8 &h // (time_steps + 1) * batch_size * hidden_size
 ) {
     const int time_steps = x.dimension(2);
@@ -125,7 +125,8 @@ void GruInferenceQuant(const Tensor2i8 &W,
             false, // training
             batch_size, input_size, hidden_size, g_blas_handle);
 
-        forward.setRescaleParam(quant_gru_scales);
+        // 得到量化GRU中使用的rescale参数
+        forward.setRescaleParam(quant_parms);
 
         forward.Run(time_steps, W_dev.data, R_dev.data, bx_dev.data, br_dev.data,
                     x_dev.data, h_dev.data, nullptr, tmp_Wx_dev.data, tmp_Rh_dev.data,
@@ -163,7 +164,6 @@ void GruInference(const Tensor2f &W,
         ScopeTimer t("Inference:");
 
         gru::ForwardPass<float> forward = gru::ForwardPass<float>(
-            false, // calibration
             false, // training
             batch_size, input_size, hidden_size, g_blas_handle);
 
@@ -209,7 +209,6 @@ void GruTrain(const Tensor2f &W, // 输入到隐藏层的权重矩阵. [input_si
     {
         ScopeTimer t("Train forward:");
         gru::ForwardPass<float> forward = gru::ForwardPass<float>(
-            false, // calibration
             true,  // training
             batch_size,
             input_size,
@@ -276,7 +275,7 @@ void checkHQuantizationWithCosine(
     int time_steps,
     int batch_size,
     int hidden_size,
-    const QuantGRUScales &scaleParam,                  // 每步 scale M, 每步 shift
+    const GRUQuantitativeParameters &scaleParam,                  // 每步 scale M, 每步 shift
     float threshold = 1.0f                          // 超阈值
 ) {
 
@@ -336,7 +335,7 @@ void calibrateGruScales(const Tensor2f &W,
                         const Tensor1f &bx,
                         const Tensor1f &br,
                         const Tensor3f &x,
-                        QuantGRUScales &quant_gru_scales
+                        GRUQuantitativeParameters &quant_gru_scales
 ) {
     const int time_steps = x.dimension(2);
     const int batch_size = x.dimension(1);
@@ -359,12 +358,13 @@ void calibrateGruScales(const Tensor2f &W,
     h_dev.zero();
 
     gru::ForwardPass<float> forward = gru::ForwardPass<float>(
-        true, // calibration
         true,  // training
         batch_size,
         input_size,
         hidden_size,
         g_blas_handle);
+
+    forward.setCalibrationMode(true, false);
 
     forward.Run(
         time_steps,
@@ -380,8 +380,7 @@ void calibrateGruScales(const Tensor2f &W,
         0.0f,
         nullptr);
 
-    // TODO 校准得到量化参数
-    // quant_gru_scales
+    quant_gru_scales = forward.getGRUQuantitativeParameters();
 }
 
 int main() {
@@ -420,8 +419,8 @@ int main() {
 
     printf("cudaError(GruInference finish): %s\n", cudaGetErrorString(cudaGetLastError()));
 
-    QuantGRUScales quant_gru_scales;
-    calibrateGruScales<int8_t>(W, R, bx, br, x, quant_gru_scales); // TODO: 效验得到固定量化参数
+    GRUQuantitativeParameters quant_parms;
+    calibrateGruScales<int8_t>(W, R, bx, br, x, quant_parms); // 效验得到固定量化参数
 
     // Quant
     Tensor2i8 W_quant(HIDDEN_DIMS * 3, INPUT_DIMS);  // 对应W_z/W_r/W_h的合并
@@ -431,7 +430,7 @@ int main() {
     Tensor3i8 x_quant(INPUT_DIMS, BATCH_SIZE, SEQUENCE_LEN);
     Tensor3i8 dh_new_quant(HIDDEN_DIMS, BATCH_SIZE, SEQUENCE_LEN + 1);
 
-    // TODO: 使用固定量化参数将输入量化
+    // 使用固定量化参数将输入量化
     GruQuantInit<false>(W,
                         R,
                         bx,
@@ -444,10 +443,7 @@ int main() {
                         br_quant,
                         x_quant,
                         dh_new_quant,
-                        quant_gru_scales);
-
-    // TODO: 得到量化GRU中使用的rescale参数
-
+                        quant_parms);
 
     // 运行量化GRU得到量化结果2
     Tensor3i8 h_quant_inference(hidden_size, batch_size, (time_steps + 1));
@@ -457,7 +453,7 @@ int main() {
                       bx_quant,
                       br_quant,
                       x_quant,
-                      quant_gru_scales,
+                      quant_parms,
                       h_quant_inference);
 
     { // Test
@@ -470,7 +466,7 @@ int main() {
                                      time_steps,
                                      batch_size,
                                      hidden_size,
-                                     quant_gru_scales);
+                                     quant_parms);
     }
 
     printf("cudaError(GruInferenceQuant finish): %s\n", cudaGetErrorString(cudaGetLastError()));

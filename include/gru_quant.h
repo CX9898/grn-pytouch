@@ -28,7 +28,7 @@ class ForwardPassQuant {
   // Blocks until all iterations have completed executing on the GPU.
   ~ForwardPassQuant();
 
-  void setRescaleParam(const QuantGRUScales &quantGruScales);
+  void setRescaleParam(const GRUQuantitativeParameters &parms);
 
   // Performs one forward iteration of the GRU cell.
   //

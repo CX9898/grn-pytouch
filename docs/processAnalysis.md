@@ -301,6 +301,8 @@ __device__ __forceinline__ int8_t tanh_int16_lut(int16_t x, const int8_t* lut) {
 >   - h: 非对称
 >   - W: 对称, per-channel
 >   - R: 对称, per-channel
+>   - Wx: 非对称
+>   - Rh: 非对称
 >   - bx: 对称, per-channel
 >   - br: 对称, per-channel
 >   - z_pre: 非对称
@@ -349,3 +351,44 @@ __device__ __forceinline__ int8_t tanh_int16_lut(int16_t x, const int8_t* lut) {
 
    > - h 是对称量化?
    > - 是不是只需要计算h的scale
+
+```C++
+struct GRUQuantitativeParameters {
+  int hidden_;
+  float scale_x_;
+  int32_t zp_x_;
+  float scale_h_;
+  int32_t zp_h_;
+
+  std::vector<float> scale_W_; // size = hidden
+  std::vector<float> scale_R_; // size = hidden
+
+  std::vector<float> scale_bx_;
+  std::vector<float> scale_br_;
+
+  float scale_z_pre_;
+  int32_t zp_z_pre_;
+  float scale_r_pre_;
+  int32_t zp_r_pre_;
+  float scale_g_pre_;
+  int32_t zp_g_pre_;
+
+  float scale_z_out_;
+  int32_t zp_z_out_;
+  float scale_r_out_;
+  int32_t zp_r_out_;
+  float scale_g_out_;
+  int32_t zp_g_out_;
+
+  std::vector<float> scale_Rh_add_br_;
+  std::vector<float> scale_rRh_;
+
+  float scale_one_minus_update_;
+  int32_t zp_one_minus_update_;
+  float scale_new_contrib_;
+  int32_t zp_new_contrib_;
+  float scale_old_contrib_;
+  int32_t zp_old_contrib_;
+};
+```
+

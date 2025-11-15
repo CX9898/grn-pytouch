@@ -109,7 +109,6 @@ namespace gru {
 
 template<typename T>
 struct ForwardPass<T>::private_data {
-  bool calibration;
   bool training;
   int batch_size;
   int input_size;
@@ -122,14 +121,12 @@ struct ForwardPass<T>::private_data {
 
 template<typename T>
 ForwardPass<T>::ForwardPass(
-    const bool calibration,
     const bool training,
     const int batch_size,
     const int input_size,
     const int hidden_size,
     const cublasHandle_t &blas_handle,
     const cudaStream_t &stream) : data_(new private_data) {
-    data_->calibration = calibration;
     data_->training = training;
     data_->batch_size = batch_size;
     data_->input_size = input_size;
@@ -356,7 +353,6 @@ void ForwardPass<T>::Run(
 
     const int NH = batch_size * hidden_size;
     for (int i = 0; i < steps; ++i) {
-        const int Rh_offset = data_->calibration ? i * NH * 3 : 0;
         IterateInternal(
             R,
             bx,
@@ -365,12 +361,20 @@ void ForwardPass<T>::Run(
             h + (i + 1) * NH,
             v + i * NH * 4,
             tmp_Wx + i * NH * 3,
-            tmp_Rh + Rh_offset,
+            tmp_Rh,
             zoneout_prob,
             zoneout_mask ? zoneout_mask + i * NH : nullptr);
     }
 
     cublasSetStream(blas_handle, save_stream);
+
+    if(calibration_mode_){
+        quant_parms_.hidden_ = data_->hidden_size;
+        if(!use_int16_quant_){
+
+        }
+        quant_parms_.scale_x_ = calculateScaleZeroPointFromDevice<int8_t>();
+    }
 }
 
 template
