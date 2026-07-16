@@ -36,10 +36,12 @@ inline EncodedScaleResult encodeFromRange(
     float max_val,
     QuantBitWidth bw,
     bool is_symmetric,
-    bool use_pot2) {
+    bool use_pot2,
+    PotScaleMethod method = PotScaleMethod::CoverRange,
+    float tolerance = 0.02f) {
     const ContinuousScaleResult cont = calibrateContinuousScaleFromRange(min_val, max_val, bw, is_symmetric);
-    // MINMAX 路径使用覆盖优先(floor)的 POT 取整，与 main calibrateQuantParams 一致。
-    return encodeScaleResult(cont.scale, cont.min, bw, is_symmetric, use_pot2, /*coverage_round=*/true);
+    // MinMax 与直方图共用 encodeScaleResult；策略由 method 决定（默认 CoverRange）
+    return encodeScaleResult(cont, bw, is_symmetric, use_pot2, method, tolerance);
 }
 
 }  // namespace
@@ -55,11 +57,14 @@ GRUQuantParams calculateGRUQuantitativeParameters(
     quant_params.hidden_ = quant_ranges.hidden_;
     quant_params.bitwidth_config_ = bitwidth_config;
     const bool usePOT2 = bitwidth_config.usePOT2_;
+    const PotScaleMethod potMethod = bitwidth_config.pot_scale_method_;
+    const float potTol = bitwidth_config.pot_scale_tolerance_;
 
     // 辅助 lambda：单值校准 -> 唯一权威 QuantParam（scale + zp）
-    auto calibrateScalar = [usePOT2](QuantBitWidth bw, bool symmetric,
+    auto calibrateScalar = [usePOT2, potMethod, potTol](QuantBitWidth bw, bool symmetric,
                                      float min_val, float max_val) -> QuantParam {
-        const EncodedScaleResult encoded = encodeFromRange(min_val, max_val, bw, symmetric, usePOT2);
+        const EncodedScaleResult encoded =
+            encodeFromRange(min_val, max_val, bw, symmetric, usePOT2, potMethod, potTol);
         return QuantParam{storedScaleForMode(encoded, usePOT2), encoded.zero_point};
     };
 
@@ -1084,6 +1089,8 @@ GRUQuantParams calculateGRUQuantitativeParametersFromHistograms(
     quant_params.hidden_ = hist_collectors.hidden_;
     quant_params.bitwidth_config_ = bitwidth_config;
     const bool usePOT2 = bitwidth_config.usePOT2_;
+    const PotScaleMethod potMethod = bitwidth_config.pot_scale_method_;
+    const float potTol = bitwidth_config.pot_scale_tolerance_;
 
     const int channel_size = hist_collectors.hidden_ * 3;
     const int hidden_size = hist_collectors.hidden_;
@@ -1095,7 +1102,7 @@ GRUQuantParams calculateGRUQuantitativeParametersFromHistograms(
         ContinuousScaleResult continuous = calibrateContinuousScaleFromHistogram(
             hist.histogram(), bw, sym, use_percentile, percentile_value);
         EncodedScaleResult encoded = encodeScaleResult(
-            continuous.scale, continuous.min, bw, sym, usePOT2);
+            continuous, bw, sym, usePOT2, potMethod, potTol);
         return QuantParam{storedScaleForMode(encoded, usePOT2), encoded.zero_point};
     };
 
@@ -1166,13 +1173,16 @@ GRUQuantParams calculateGRUQuantitativeParametersFromGPUHistograms(
     quant_params.hidden_ = gpu_collectors.hidden_;
     quant_params.bitwidth_config_ = bitwidth_config;
     const bool usePOT2 = bitwidth_config.usePOT2_;
+    const PotScaleMethod potMethod = bitwidth_config.pot_scale_method_;
+    const float potTol = bitwidth_config.pot_scale_tolerance_;
     
     const int channel_size = gpu_collectors.hidden_ * 3;
     const int hidden_size = gpu_collectors.hidden_;
 
     // Helper: 由连续 scale 编码为唯一权威 QuantParam
     auto sqnrEncode = [&](const ContinuousScaleResult& cont, QuantBitWidth bw, bool sym) -> QuantParam {
-        EncodedScaleResult encoded = encodeScaleResult(cont.scale, cont.min, bw, sym, usePOT2);
+        EncodedScaleResult encoded =
+            encodeScaleResult(cont, bw, sym, usePOT2, potMethod, potTol);
         return QuantParam{storedScaleForMode(encoded, usePOT2), encoded.zero_point};
     };
 

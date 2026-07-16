@@ -7,12 +7,12 @@
  * 1. 直方图收集 - 在 histogram_collector.h
  * 2. Percentile 校准 - calibratePercentile()
  * 3. SQNR 校准 - calibrateSqnr()
- * 4. POT 转换 - convertToPot(), roundScaleToPowerOfTwo(), applyBitwidthConstraint()
+ * 4. POT 转换 - encodeScaleResult() / convertToPot()（策略由 PotScaleMethod 决定）
  * 
  * 调用流程：
- * Histogram → [calibratePercentile/calibrateSqnr] → ContinuousScaleResult → [convertToPot] → PotScaleResult
+ *   MinMax/Histogram → ContinuousScaleResult → encodeScaleResult(method) → EncodedScaleResult
  * 
- * 统一入口：calibrateQuantParamsFromHistogram()
+ * MinMax 与直方图共用同一编码入口；默认 PotScaleMethod::CoverRange（与 AIMET 一致）。
  */
 
 #include <algorithm>
@@ -20,58 +20,14 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
 
 #include "histogram_collector.h"
 #include "quantize_param_types.h"
 #include "quantize_bitwidth_config.h"  // for QuantBitWidth
+#include "scale_encoding.h"            // ContinuousScaleResult / encodeScaleResult / convertToPot
 #include "quantize_ops_helper.h"       // for round_f, round_to_int
-
-// ============================================================================
-// 公共数据结构
-// ============================================================================
-
-/**
- * 连续 scale 校准结果（模块 2/3 的输出）
- */
-struct ContinuousScaleResult {
-    float scale;      // 连续 scale
-    float min;        // 量化范围最小值
-    float max;        // 量化范围最大值
-    float noise;      // 估计噪声（仅 SQNR 使用）
-};
-
-/**
- * POT scale 结果（模块 4 的输出）
- */
-struct PotScaleResult {
-    int8_t exp2_inv;   // POT 指数 (scale = 2^(-exp2_inv))
-    float po2_scale;   // POT scale 值
-    int32_t zero_point; // 零点
-};
-
-struct AffineScaleResult {
-    FixedPointScale fixed_scale;
-    float effective_scale;
-    int32_t zero_point;
-};
-
-struct EncodedScaleResult {
-    float continuous_scale;
-    FixedPointScale fixed_scale;
-    float effective_scale;
-    int8_t pot_shift;
-    int32_t zero_point;
-};
-
-/**
- * 按量化模式选择落盘/导出的 scale：
- *   - POT2: effective_scale (po2_scale = 2^-shift, M=1)
- *   - Affine: continuous_scale (编译器侧再 encodeMShift)
- */
-inline float storedScaleForMode(const EncodedScaleResult& encoded, bool use_pot2) {
-    return use_pot2 ? encoded.effective_scale : encoded.continuous_scale;
-}
 
 // ============================================================================
 // 模块 2: Percentile 校准
@@ -393,136 +349,6 @@ inline ContinuousScaleResult calibrateSqnr(
     }
 }
 
-// ============================================================================
-// 模块 4: POT 转换工具函数
-// ============================================================================
-
-/**
- * 转换连续 scale 为 POT（AIMET find_closest_power_of_2_scale）
- * 
- * @param scale 连续 scale
- * @return {po2_scale, exp2_inv} 其中 po2_scale = 2^(-exp2_inv)
- */
-inline std::pair<float, int8_t> roundScaleToPowerOfTwo(float scale) {
-    if (scale <= 0) {
-        throw std::runtime_error("Invalid scale <= 0 in roundScaleToPowerOfTwo");
-    }
-    float n = -std::log2(scale);
-    int8_t n_rounded = checkedShiftToInt8(round_f(n), "roundScaleToPowerOfTwo");
-    return {std::pow(2.0f, -static_cast<float>(n_rounded)), n_rounded};
-}
-
-/**
- * 计算 zero-point
- * 
- * @param continuous_min 量化范围最小值
- * @param po2_scale POT scale
- * @param quant_min 量化最小值
- * @param is_symmetric 是否对称量化
- * @return zero-point
- */
-inline int32_t computeZeroPoint(float continuous_min, float po2_scale, 
-                                int64_t quant_min, bool is_symmetric) {
-    if (is_symmetric) {
-        return 0;
-    } else {
-        float zp_fp = static_cast<float>(quant_min) - continuous_min / po2_scale;
-        return round_to_int(zp_fp);
-    }
-}
-
-/**
- * 转换连续 scale 为 POT 形式（与 AIMET 一致）
- * 
- * 策略：
- * 1. 四舍五入 scale 到最近的 2^n
- * 2. 保持 qmin, qmax 不变
- * 3. 计算 zero-point
- * 
- * 注意：与 AIMET 一致，不做位宽约束。如果 POT scale 变小，
- * 硬件需要支持饱和处理（saturate）或调用方需要调整 rmin/rmax。
- * 
- * @param continuous_scale 连续 scale
- * @param continuous_min 连续 min（用于计算 zero-point）
- * @param bw 量化位宽配置
- * @param is_symmetric 是否对称量化
- * @return PotScaleResult
- */
-inline PotScaleResult convertToPot(
-    float continuous_scale,
-    float continuous_min,
-    QuantBitWidth bw,
-    bool is_symmetric,
-    bool coverage_round = false) {
-
-    const int64_t quant_min = bw.qmin();
-
-    int8_t n;
-    float po2_scale;
-    if (coverage_round) {
-        // MINMAX 路径：与 main calibrateQuantParams 一致，向上取 scale（floor(log2(1/scale))）
-        // 保证 POT scale >= 连续 scale，避免范围被截断（覆盖优先）。
-        n = checkedShiftToInt8(std::floor(std::log2(1.0f / continuous_scale)), "convertToPot");
-        po2_scale = std::pow(2.0f, -static_cast<float>(n));
-    } else {
-        // 直方图(SQNR/Percentile)路径：四舍五入到最近 2^n（AIMET find_closest_power_of_2_scale）
-        std::tie(po2_scale, n) = roundScaleToPowerOfTwo(continuous_scale);
-    }
-
-    int32_t zp;
-    if (is_symmetric) {
-        zp = 0;
-    } else if (coverage_round) {
-        // 与 main calibrateQuantParams 一致：将 min 对齐到 POT 网格后再算 zp
-        const float aligned_min = std::floor(continuous_min / po2_scale) * po2_scale;
-        zp = round_to_int(static_cast<float>(quant_min) - aligned_min / po2_scale);
-    } else {
-        zp = computeZeroPoint(continuous_min, po2_scale, quant_min, is_symmetric);
-    }
-
-    return PotScaleResult{n, po2_scale, zp};
-}
-
-inline AffineScaleResult convertToAffineScale(
-    float continuous_scale,
-    float continuous_min,
-    QuantBitWidth bw,
-    bool is_symmetric) {
-    FixedPointScale fs = encodeMShift(continuous_scale);
-    float effective = decodeMShift(fs);
-    int32_t zp = computeZeroPoint(continuous_min, effective, bw.qmin(), is_symmetric);
-    return AffineScaleResult{fs, effective, zp};
-}
-
-inline EncodedScaleResult encodeScaleResult(
-    float continuous_scale,
-    float continuous_min,
-    QuantBitWidth bw,
-    bool is_symmetric,
-    bool use_pot2,
-    bool coverage_round = false) {
-    if (use_pot2) {
-        PotScaleResult pot = convertToPot(continuous_scale, continuous_min, bw, is_symmetric, coverage_round);
-        return EncodedScaleResult{
-            continuous_scale,
-            FixedPointScale{1u, pot.exp2_inv},
-            pot.po2_scale,
-            pot.exp2_inv,
-            pot.zero_point
-        };
-    }
-
-    AffineScaleResult affine = convertToAffineScale(continuous_scale, continuous_min, bw, is_symmetric);
-    int8_t compat_shift = static_cast<int8_t>(round_f(-std::log2(affine.effective_scale)));
-    return EncodedScaleResult{
-        continuous_scale,
-        affine.fixed_scale,
-        affine.effective_scale,
-        compat_shift,
-        affine.zero_point
-    };
-}
-
 inline ContinuousScaleResult calibrateContinuousScaleFromHistogram(
     const Histogram &hist,
     QuantBitWidth bw,
@@ -619,16 +445,7 @@ inline ContinuousScaleResult calibrateContinuousScaleFromRange(
 /**
  * 从直方图计算 POT 量化参数
  * 
- * 调用流程: Histogram → [calibratePercentile/calibrateSqnr] → [convertToPot] → 最终参数
- * 
- * @param hist 直方图数据
- * @param bw 量化位宽配置（包含 is_unsigned_ 信息）
- * @param is_symmetric 是否对称量化
- * @param exp2_inv [out] POT 指数
- * @param zp [out] 零点
- * @param name 调试名称（可选）
- * @param use_percentile 使用 Percentile 校准（false = SQNR）
- * @param percentile 百分位数（仅当 use_percentile=true 时有效）
+ * 调用流程: Histogram → ContinuousScaleResult → encodeScaleResult(CoverRange) → POT
  */
 inline void calibrateQuantParamsFromHistogram(
     const Histogram& hist,
@@ -638,32 +455,30 @@ inline void calibrateQuantParamsFromHistogram(
     int32_t& zp,
     const char* name = nullptr,
     bool use_percentile = false,
-    float percentile = 99.99f) {
+    float percentile = 99.99f,
+    PotScaleMethod method = PotScaleMethod::CoverRange,
+    float tolerance = 0.02f) {
     
     if (!hist.is_valid()) {
         throw std::runtime_error("Histogram is invalid in calibrateQuantParamsFromHistogram");
     }
     
-    // 步骤 1: 使用对应的校准方法计算连续 scale
     ContinuousScaleResult continuous_result = calibrateContinuousScaleFromHistogram(
         hist, bw, is_symmetric, use_percentile, percentile);
     
-    // 步骤 2: 转换为 POT（与 AIMET 一致，无位宽约束）
-    PotScaleResult pot_result = convertToPot(
-        continuous_result.scale,
-        continuous_result.min,
-        bw,
-        is_symmetric);
+    EncodedScaleResult encoded = encodeScaleResult(
+        continuous_result, bw, is_symmetric, /*use_pot2=*/true, method, tolerance);
     
-    exp2_inv = pot_result.exp2_inv;
-    zp = pot_result.zero_point;
+    exp2_inv = encoded.pot_shift;
+    zp = encoded.zero_point;
     
 #ifdef DEBUG
     if (name && name[0]) {
         const char* scheme_name = use_percentile ? "PERC" : "SQNR";
+        const bool is_unsigned = bw.is_unsigned_;
         printf("[%s][%s] unsigned=%d range=[%.4f,%.4f] cont_scale=%.6f po2=%.6f(1/2^%d) zp=%d\n",
                scheme_name, name, is_unsigned, hist.min_val, hist.max_val, 
-               continuous_result.scale, pot_result.po2_scale, pot_result.exp2_inv, pot_result.zero_point);
+               continuous_result.scale, encoded.effective_scale, encoded.pot_shift, encoded.zero_point);
     }
 #endif
 }

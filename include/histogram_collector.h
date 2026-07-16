@@ -20,7 +20,10 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include "pot_scale_encode.h"  // checkedShiftToInt8 / isNearPowerOfTwo / scaleToPowerOfTwo
 
 /**
  * 与 AIMET _get_minimum_scale 完全一致的实现
@@ -32,19 +35,6 @@ inline float get_minimum_scale(int64_t num_steps) {
     constexpr float fp32_eps = 1.19209290e-07f;  // float32 epsilon
     constexpr float min_range_to_represent = 0.01f;  // (-0.005, 0.005) 范围
     return std::min(fp32_eps, min_range_to_represent / static_cast<float>(num_steps));
-}
-
-/**
- * 将 POT shift 安全收窄到 int8。32bit 量化下 scale 极小、shift 可能很大，
- * 若静默截断成 int8 会得到错误的 scale，因此在标定阶段直接抛错暴露问题。
- * 仅供 host 端标定代码调用。
- */
-inline int8_t checkedShiftToInt8(float n, const char* ctx) {
-    if (n < static_cast<float>(std::numeric_limits<int8_t>::min()) ||
-        n > static_cast<float>(std::numeric_limits<int8_t>::max())) {
-        throw std::runtime_error(std::string("POT shift out of int8 range in ") + ctx);
-    }
-    return static_cast<int8_t>(n);
 }
 
 /**
