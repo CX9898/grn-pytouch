@@ -10,6 +10,22 @@
 
 ### 新增 (Added)
 
+### 变更 (Changed)
+
+### 修复 (Fixed)
+
+### 性能 (Performance)
+
+### 破坏性变更 (Breaking Changes)
+
+### 说明 (Notes)
+
+---
+
+## [1.0.11] - 2026-07-16
+
+### 新增 (Added)
+
 1. **统一 POT scale 编码入口 `encodeScaleResult(ContinuousScaleResult, PotScaleMethod)`**
    - 新增 `PotScaleMethod`：`Round` / `CoverRange`（默认）/ `Floor`，挂在 `OperatorQuantConfig.pot_scale_method_`（容差 `pot_scale_tolerance_=0.02`）。
    - 核心取整 `scaleToPowerOfTwo` 与 `PotScaleMethod` 收敛到底层头 `pot_scale_encode.h`（零项目内依赖），与 AIMET `find_closest_power_of_2_scale(cover_range)` 对齐：`real_range≈2^k` 则 round，否则 floor 覆盖。`quantize_bitwidth_config.h` / `histogram_collector.h` 改为包含该头，消除重复定义。
@@ -23,15 +39,9 @@
    - 新增 `scale_encoding.h`（编码层，位于 `quantize_param_types.h` 之上）：迁入 `encodeMShift` / `decodeMShift` / `pot2Shift` / `toFixedScale(s)` / `makeRescale*`（原 `quantize_ops_helper.h`）与 `ContinuousScaleResult` / `EncodedScaleResult` / `convertToPot` / `encodeScaleResult` / `printParms`（原 `pot_sqnr_calibrator.h`）。
    - `quantize_ops_helper.h` 回归纯运行时量化算子；`pot_sqnr_calibrator.h` 回归纯 SQNR / Percentile / MinMax range 连续 scale 校准。`gru_quant.h` / `gru_quant_cpu.h` 默认包含 `scale_encoding.h`，使用方无需改动。
 
-### 修复 (Fixed)
-
-### 性能 (Performance)
-
 ### 破坏性变更 (Breaking Changes)
 
 1. **直方图 POT2 默认由纯 Round 改为 CoverRange**：在 `usePOT2_=true` 时，原先可能把 scale 四舍五入调小（裁剪极端值）的算子，现默认改为覆盖优先（与 AIMET `apply_power_of_2_workflow(method="cover_range")` 一致）。若需旧行为，设 `pot_scale_method_=0`（Round）。
-
-### 说明 (Notes)
 
 ---
 
