@@ -9,6 +9,7 @@
 #include "quantize_bitwidth_config.h"
 #include "quantize_lut_types.h"   // 复用 LUT 结构体和生成函数（CPU/GPU 共用）
 #include "quantize_ops_helper.h"  // 复用 rshift_round, quantize_* 等函数
+#include "scale_encoding.h"       // encodeMShift / toFixedScale(s) / makeRescale*（setRescaleParam 用）
 
 // ============================================================================
 // gru_quant_cpu.h - 纯 C++ 定点 GRU 前向传播接口

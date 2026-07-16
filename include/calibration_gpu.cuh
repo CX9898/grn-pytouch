@@ -428,7 +428,7 @@ void collect_per_channel_histograms_batch(PerChannelHistogramBatch& batch,
  * @brief GPU 加速的 SQNR 连续 scale 搜索
  *
  * 只做计算密集的 SQNR 搜索，返回连续 scale 结果
- * POT 转换统一使用 CPU 的 convertToPot() 函数
+ * POT 转换统一使用 CPU 的 encodeScaleResult() / convertToPot()（PotScaleMethod）
  *
  * @param counts_dev GPU 端直方图 counts
  * @param hist_min 直方图最小值

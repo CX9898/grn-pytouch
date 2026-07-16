@@ -104,6 +104,9 @@ struct OperatorQuantConfigPy {
     int bw_granularity_ = 2;
     int br_granularity_ = 2;
     bool usePOT2_ = false;
+    // 0=Round, 1=CoverRange(default), 2=Floor —— 与 C++ PotScaleMethod 一致
+    int pot_scale_method_ = 1;
+    float pot_scale_tolerance_ = 0.02f;
 
     // 方法声明（实现在文件末尾）
     OperatorQuantConfigPy();                           // 默认构造函数：从 C++ 默认值初始化
@@ -1074,6 +1077,8 @@ OperatorQuantConfig OperatorQuantConfigPy::to_cpp() const {
     cfg.bw_granularity_ = static_cast<OperatorQuantConfig::QuantizationGranularity>(bw_granularity_);
     cfg.br_granularity_ = static_cast<OperatorQuantConfig::QuantizationGranularity>(br_granularity_);
     cfg.usePOT2_ = usePOT2_;
+    cfg.pot_scale_method_ = static_cast<PotScaleMethod>(pot_scale_method_);
+    cfg.pot_scale_tolerance_ = pot_scale_tolerance_;
     return cfg;
 }
 
@@ -1139,6 +1144,8 @@ void OperatorQuantConfigPy::from_cpp(const OperatorQuantConfig &cfg) {
     bw_granularity_ = static_cast<int>(cfg.bw_granularity_);
     br_granularity_ = static_cast<int>(cfg.br_granularity_);
     usePOT2_ = cfg.usePOT2_;
+    pot_scale_method_ = static_cast<int>(cfg.pot_scale_method_);
+    pot_scale_tolerance_ = cfg.pot_scale_tolerance_;
 }
 
 // ============================================================================
@@ -1424,7 +1431,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("R_granularity_", &OperatorQuantConfigPy::R_granularity_)
         .def_readwrite("bw_granularity_", &OperatorQuantConfigPy::bw_granularity_)
         .def_readwrite("br_granularity_", &OperatorQuantConfigPy::br_granularity_)
-        .def_readwrite("usePOT2_", &OperatorQuantConfigPy::usePOT2_);
+        .def_readwrite("usePOT2_", &OperatorQuantConfigPy::usePOT2_)
+        .def_readwrite("pot_scale_method_", &OperatorQuantConfigPy::pot_scale_method_)
+        .def_readwrite("pot_scale_tolerance_", &OperatorQuantConfigPy::pot_scale_tolerance_);
 
     // GRUQuantParams 绑定
     py::class_<GRUQuantParamsPy>(m, "GRUQuantParams")

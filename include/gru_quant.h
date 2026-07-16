@@ -4,6 +4,7 @@
 #include <cuda_runtime_api.h>
 
 #include "quantize_ops_helper.h"
+#include "scale_encoding.h"  // encodeMShift / toFixedScale(s) / makeRescale*（setRescaleParam 用）
 
 namespace gru {
 

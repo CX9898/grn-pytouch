@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include "cuda_compat.h"
+#include "pot_scale_encode.h"  // for PotScaleMethod（scale 编码策略字段类型）
 
 struct QuantBitWidth {
     int8_t bits_ = 8;
@@ -84,6 +85,10 @@ struct OperatorQuantConfig {
     bool mul_old_contribution_symmetric_ = false, mul_new_contribution_symmetric_ = false;
     // true: POT2 (multiplier=1, shift-only fast path), false: affine M+shift
     bool usePOT2_ = false;
+    // POT2 取整策略（仅 usePOT2_=true 时生效）；默认 CoverRange，与 AIMET apply_power_of_2 一致
+    PotScaleMethod pot_scale_method_ = PotScaleMethod::CoverRange;
+    // CoverRange 下判断 real_range 是否接近 2^k 的相对容差
+    float pot_scale_tolerance_ = 0.02f;
 
     OperatorQuantConfig& setAllBitWidths(int8_t bits) {
         QuantBitWidth* signed_members[] = {
@@ -102,6 +107,16 @@ struct OperatorQuantConfig {
 
     OperatorQuantConfig& setUsePOT2(bool usePOT2) {
         usePOT2_ = usePOT2;
+        return *this;
+    }
+
+    OperatorQuantConfig& setPotScaleMethod(PotScaleMethod method) {
+        pot_scale_method_ = method;
+        return *this;
+    }
+
+    OperatorQuantConfig& setPotScaleTolerance(float tolerance) {
+        pot_scale_tolerance_ = tolerance;
         return *this;
     }
 };

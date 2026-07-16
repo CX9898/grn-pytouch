@@ -52,6 +52,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 // CUDA 编译时使用内置 min/max（有 __device__ 修饰）
@@ -231,122 +232,6 @@ __host__ __device__ __forceinline__ int64_t applyRescale(int64_t x, FixedPointSc
 
 __host__ __device__ __forceinline__ float applyRescale(float x, FloatRescale r) {
     return x * r.inv_div;
-}
-
-// ============================================================================
-// 单一权威种子 -> 执行表示派生（host 端）
-// ============================================================================
-// 把唯一权威 QuantParam（scale + zero_point）按需派生为各 kernel 消费的执行
-// 表示（FixedPointScale / Pot2Rescale / FloatRescale）。这些是纯量化算子转换，
-// 不含任何校准（直方图/SQNR）逻辑，故归属算子层；setRescaleParam / 权重量化 /
-// 量化-反量化 boundary 使用。均为 host-only（含 throw、std::frexp 等）。
-
-// 连续 scale -> 16bit 乘子 + 移位定点（scale ≈ multiplier * 2^-shift）。
-inline FixedPointScale encodeMShift(float scale) {
-    if (!(scale > 0.0f)) {
-        throw std::runtime_error("Invalid scale <= 0 in encodeMShift");
-    }
-    int exp2 = 0;
-    double mant = std::frexp(static_cast<double>(scale), &exp2);  // scale = mant * 2^exp2
-    uint32_t m = static_cast<uint32_t>(std::llround(mant * 65536.0));
-    if (m == 65536u) {
-        m = 32768u;
-        exp2 += 1;
-    }
-    if (m < 32768u) {
-        m = 32768u;
-    }
-    const int shift = 16 - exp2;
-    if (shift < std::numeric_limits<int8_t>::min() || shift > std::numeric_limits<int8_t>::max()) {
-        throw std::runtime_error("encodeMShift shift out of int8 range");
-    }
-    return FixedPointScale{static_cast<uint16_t>(m), static_cast<int8_t>(shift)};
-}
-
-inline float decodeMShift(const FixedPointScale &s) {
-    return static_cast<float>(s.multiplier) * std::ldexp(1.0f, -static_cast<int>(s.shift));
-}
-
-// POT2 整数移位：scale = 2^-shift  =>  shift = round(-log2(scale))。
-// 仅当 scale 已是 2 的幂（POT2 模式权威）时精确；仿射连续 scale 请改用 encodeMShift。
-inline int8_t pot2Shift(const QuantParam &q) {
-    if (!(q.scale > 0.0f)) return 0;
-    return static_cast<int8_t>(std::lround(-std::log2(static_cast<double>(q.scale))));
-}
-
-// 量化 boundary 用：把单个 QuantParam 派生为 FixedPointScale。
-//   - POT2 : {1, shift}（shift 由 scale 无损还原）
-//   - 仿射 : encodeMShift(连续 scale)
-inline FixedPointScale toFixedScale(const QuantParam &q, bool use_pot2) {
-    if (use_pot2) return FixedPointScale{1, pot2Shift(q)};
-    return encodeMShift(q.scale);
-}
-
-inline std::vector<FixedPointScale> toFixedScales(const ChannelQuantParam &c, bool use_pot2) {
-    std::vector<FixedPointScale> out(c.channels.size());
-    for (size_t i = 0; i < c.channels.size(); ++i) out[i] = toFixedScale(c.channels[i], use_pot2);
-    return out;
-}
-
-// makeRescale<R>: 由源/目标权威 QuantParam 推导 rescale 执行表示。
-//   - POT2 : 整数移位差（与现状 bit 级一致，零 float）
-//   - 仿射 : 原始连续 scale 比值 + encodeMShift（绝不经 fixed_scale 往返）
-//   - FP   : src_scale / dst_scale
-// 提供单值与"两源乘积"（GEMM：src_scale = a.scale * b.scale）两组。
-template <class R>
-R makeRescale(const QuantParam &src, const QuantParam &dst);
-
-template <>
-inline Pot2Rescale makeRescale<Pot2Rescale>(const QuantParam &src, const QuantParam &dst) {
-    return Pot2Rescale{static_cast<int8_t>(pot2Shift(src) - pot2Shift(dst))};
-}
-
-template <>
-inline FixedPointScale makeRescale<FixedPointScale>(const QuantParam &src, const QuantParam &dst) {
-    return encodeMShift(src.scale / dst.scale);
-}
-
-template <>
-inline FloatRescale makeRescale<FloatRescale>(const QuantParam &src, const QuantParam &dst) {
-    return FloatRescale{src.scale / dst.scale};
-}
-
-// 两源乘积版（GEMM：源 scale = a.scale * b.scale）
-template <class R>
-R makeRescaleProduct(const QuantParam &a, const QuantParam &b, const QuantParam &dst);
-
-template <>
-inline Pot2Rescale makeRescaleProduct<Pot2Rescale>(const QuantParam &a, const QuantParam &b, const QuantParam &dst) {
-    return Pot2Rescale{static_cast<int8_t>(pot2Shift(a) + pot2Shift(b) - pot2Shift(dst))};
-}
-
-template <>
-inline FixedPointScale makeRescaleProduct<FixedPointScale>(const QuantParam &a, const QuantParam &b, const QuantParam &dst) {
-    return encodeMShift((a.scale * b.scale) / dst.scale);
-}
-
-template <>
-inline FloatRescale makeRescaleProduct<FloatRescale>(const QuantParam &a, const QuantParam &b, const QuantParam &dst) {
-    return FloatRescale{(a.scale * b.scale) / dst.scale};
-}
-
-// 单源 -> "两源乘积"目标（GEMM bias：bias 从自身 scale 进入累加器 scale = a.scale * b.scale）
-template <class R>
-R makeRescaleToProduct(const QuantParam &src, const QuantParam &a, const QuantParam &b);
-
-template <>
-inline Pot2Rescale makeRescaleToProduct<Pot2Rescale>(const QuantParam &src, const QuantParam &a, const QuantParam &b) {
-    return Pot2Rescale{static_cast<int8_t>(pot2Shift(src) - (pot2Shift(a) + pot2Shift(b)))};
-}
-
-template <>
-inline FixedPointScale makeRescaleToProduct<FixedPointScale>(const QuantParam &src, const QuantParam &a, const QuantParam &b) {
-    return encodeMShift(src.scale / (a.scale * b.scale));
-}
-
-template <>
-inline FloatRescale makeRescaleToProduct<FloatRescale>(const QuantParam &src, const QuantParam &a, const QuantParam &b) {
-    return FloatRescale{src.scale / (a.scale * b.scale)};
 }
 
 // ============================================================================
@@ -1141,18 +1026,11 @@ void applyZeroPointCompensation2D(int32_t *Y_int32, const int32_t *weight_sum, c
 // ============================================================================
 
 /**
- * @brief 量化参数校准函数（与 AIMET MinMaxEncodingAnalyzer.compute_encodings_from_stats 完全一致）
+ * @brief 量化参数校准函数（MinMax → 连续 scale → 公共 POT 编码）
  *
- * 根据数据范围和位宽配置计算量化参数，缩放因子对齐到 2 的负 n 次方。
- * 
- * 与 AIMET 的一致性:
- *   1. num_steps 检查
- *   2. 使用 get_minimum_scale(num_steps)
- *   3. 确保 0 在范围内
- *   4. 范围扩展逻辑（对称/非对称分别处理）
- *   5. 对称量化 delta 计算（区分 pos/neg steps）
- *   6. 2-bit 特殊处理
- *   7. Inf 保护
+ * 流程与直方图路径一致：
+ *   1. 按 AIMET MinMax 规则得到连续 scale / min / max
+ *   2. 经 scaleToPowerOfTwo(CoverRange) 得到 POT scale（与 encodeScaleResult 同源）
  *
  * @param[in] orig_min 原始数据最小值
  * @param[in] orig_max 原始数据最大值
@@ -1207,37 +1085,28 @@ inline void calibrateQuantParams(float orig_min, float orig_max, QuantBitWidth b
         updated_min = min_with_zero;
     }
     
-    float scale;
+    float raw_scale;
+    float cont_min, cont_max;
     if (is_symmetric) {
         zp = 0;
         
         // UINT + symmetric: 特殊处理（zp=0，范围 [0, qmax]）
         if (bw.is_unsigned_) {
-            // UINT 对称量化：数据范围 [0, max]，量化范围 [0, qmax]
-            // scale = max / qmax，确保 max 能被正确量化
             float data_max = std::max(updated_max, minimum_scale);
-            float raw_scale = data_max / static_cast<float>(quant_max);
+            raw_scale = data_max / static_cast<float>(quant_max);
             raw_scale = std::max(raw_scale, minimum_scale);
-            
-            // POT 转换
-            exp2_inv = checkedShiftToInt8(std::floor(std::log2(1.0f / raw_scale)), "calibrateQuantParams(uint-sym)");
-            scale = exp2_scale(exp2_inv);
-            aligned_min = 0.0f;
-            aligned_max = scale * static_cast<float>(quant_max);
+            cont_min = 0.0f;
+            cont_max = raw_scale * static_cast<float>(quant_max);
         } else {
             // INT 对称量化：与 AIMET 一致
             const int64_t num_pos_steps = num_steps / 2;           // floor(N/2), 8-bit: 127
             const int64_t num_neg_steps = (num_steps + 1) / 2;     // ceil(N/2),  8-bit: 128
             
-            // 与 AIMET 一致: 2-bit 特殊处理
-            // "For 2-bit quantization, using math.floor to compute num_pos_steps can result 
-            //  in a wasted bin on the negative side given a symmetrically distributed weight."
             int additional_step_for_calibration = 0;
             if (num_steps == 3) {  // 2-bit strict symmetric
                 additional_step_for_calibration = 1;
             }
             
-            // 与 AIMET 一致: delta = max(max/(pos+additional), -min/neg)
             float delta_from_max = (num_pos_steps + additional_step_for_calibration > 0) 
                                  ? updated_max / (num_pos_steps + additional_step_for_calibration)
                                  : 0.0f;
@@ -1245,34 +1114,43 @@ inline void calibrateQuantParams(float orig_min, float orig_max, QuantBitWidth b
                                  ? -updated_min / num_neg_steps 
                                  : 0.0f;
             float delta = std::max(delta_from_max, delta_from_min);
-            delta = std::max(delta, minimum_scale);  // 确保 delta >= minimum_scale
+            delta = std::max(delta, minimum_scale);
             
-            // 与 AIMET 一致: 重新计算 min/max
-            // offset = -num_neg_steps
-            // updated_min = offset * delta = -num_neg_steps * delta
-            // updated_max = num_pos_steps * delta
-            updated_min = -static_cast<float>(num_neg_steps) * delta;
-            updated_max = static_cast<float>(num_pos_steps) * delta;
-            
-            // POT 转换
-            float raw_scale = delta;
-            exp2_inv = checkedShiftToInt8(std::floor(std::log2(1.0f / raw_scale)), "calibrateQuantParams(int-sym)");
-            scale = exp2_scale(exp2_inv);
-            aligned_max = scale * num_pos_steps;
-            aligned_min = -scale * num_neg_steps;
+            cont_min = -static_cast<float>(num_neg_steps) * delta;
+            cont_max = static_cast<float>(num_pos_steps) * delta;
+            raw_scale = delta;
         }
     } else {
         // 非对称量化
         float range = updated_max - updated_min;
         range = std::max(range, minimum_scale * static_cast<float>(num_steps));
-        float raw_scale = range / static_cast<float>(num_steps);
+        raw_scale = range / static_cast<float>(num_steps);
+        cont_min = updated_min;
+        cont_max = updated_min + raw_scale * static_cast<float>(num_steps);
+    }
 
-        exp2_inv = checkedShiftToInt8(std::floor(std::log2(1.0f / raw_scale)), "calibrateQuantParams(asym)");
-        scale = exp2_scale(exp2_inv);
+    // 公共 POT 编码（默认 CoverRange，与 encodeScaleResult / AIMET 一致）
+    float scale;
+    std::tie(scale, exp2_inv) = scaleToPowerOfTwo(
+        raw_scale,
+        PotScaleMethod::CoverRange,
+        cont_min,
+        cont_max,
+        /*tolerance*/ 0.02f);
 
-        aligned_min = std::floor(updated_min / scale) * scale;
-        aligned_max = std::ceil(updated_max / scale) * scale;
-
+    if (is_symmetric) {
+        if (bw.is_unsigned_) {
+            aligned_min = 0.0f;
+            aligned_max = scale * static_cast<float>(quant_max);
+        } else {
+            const int64_t num_pos_steps = num_steps / 2;
+            const int64_t num_neg_steps = (num_steps + 1) / 2;
+            aligned_max = scale * static_cast<float>(num_pos_steps);
+            aligned_min = -scale * static_cast<float>(num_neg_steps);
+        }
+    } else {
+        aligned_min = std::floor(cont_min / scale) * scale;
+        aligned_max = std::ceil(cont_max / scale) * scale;
         zp = round_to_int(quant_min - aligned_min / scale);
     }
     
@@ -1581,51 +1459,4 @@ inline int8_t determine_shift_bits(float max_val, QuantBitWidth bw) {
     float scale = max_val / qmax;
     int8_t shift_bits = static_cast<int8_t>(std::floor(-std::log2(scale)));
     return std::max(static_cast<int8_t>(0), shift_bits);
-}
-
-// ============================================================================
-// 调试函数
-// ============================================================================
-
-/// @brief 打印 GRU 量化参数（调试用）
-inline void printParms(const GRUQuantParams &quant_parms) {
-    printf("GRUQuantParams:\n");
-    printf("  hidden = %d\n", quant_parms.hidden_);
-
-    // 输入/隐状态
-    printf("  x:  exp2_inv=%2d, zp=%d\n", pot2Shift(quant_parms.x_), quant_parms.x_.zero_point);
-    printf("  h:  exp2_inv=%2d, zp=%d\n", pot2Shift(quant_parms.h_), quant_parms.h_.zero_point);
-
-    // Per-channel 权重（唯一权威 per-channel 数组）
-    auto print_vec = [](const char *name, const ChannelQuantParam &c) {
-        printf("  %s (size %zu): ", name, c.channels.size());
-        for (size_t i = 0; i < c.channels.size() && i < 5; ++i) printf("%d ", pot2Shift(c.channels[i]));
-        if (c.channels.size() > 5) printf("...");
-        printf("\n");
-    };
-    print_vec("W ", quant_parms.W_);
-    print_vec("R ", quant_parms.R_);
-    print_vec("bw", quant_parms.bw_);
-    print_vec("br", quant_parms.br_);
-
-    // Linear 输出
-    printf("  weight_ih_linear: shift=%2d, zp=%d\n", pot2Shift(quant_parms.weight_ih_linear_), quant_parms.weight_ih_linear_.zero_point);
-    printf("  weight_hh_linear: shift=%2d, zp=%d\n", pot2Shift(quant_parms.weight_hh_linear_), quant_parms.weight_hh_linear_.zero_point);
-
-    // 门参数
-    printf("  update_gate_input:  exp2_inv=%2d, zp=%d\n", pot2Shift(quant_parms.update_gate_input_), quant_parms.update_gate_input_.zero_point);
-    printf("  update_gate_output: exp2_inv=%2d, zp=%d\n", pot2Shift(quant_parms.update_gate_output_), quant_parms.update_gate_output_.zero_point);
-    printf("  reset_gate_input:   exp2_inv=%2d, zp=%d\n", pot2Shift(quant_parms.reset_gate_input_), quant_parms.reset_gate_input_.zero_point);
-    printf("  reset_gate_output:  exp2_inv=%2d, zp=%d\n", pot2Shift(quant_parms.reset_gate_output_), quant_parms.reset_gate_output_.zero_point);
-    printf("  new_gate_input:     exp2_inv=%2d, zp=%d\n", pot2Shift(quant_parms.new_gate_input_), quant_parms.new_gate_input_.zero_point);
-    printf("  new_gate_output:    exp2_inv=%2d, zp=%d\n", pot2Shift(quant_parms.new_gate_output_), quant_parms.new_gate_output_.zero_point);
-
-    // 中间计算
-    printf("  mul_reset_hidden:   exp2_inv=%2d, zp=%d\n", pot2Shift(quant_parms.mul_reset_hidden_), quant_parms.mul_reset_hidden_.zero_point);
-
-    // 隐状态更新
-    printf("  mul_new_contribution: exp2_inv=%2d, zp=%d\n", pot2Shift(quant_parms.mul_new_contribution_),
-           quant_parms.mul_new_contribution_.zero_point);
-    printf("  mul_old_contribution: exp2_inv=%2d, zp=%d\n", pot2Shift(quant_parms.mul_old_contribution_),
-           quant_parms.mul_old_contribution_.zero_point);
 }
